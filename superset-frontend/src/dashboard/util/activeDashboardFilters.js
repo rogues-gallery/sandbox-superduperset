@@ -23,7 +23,7 @@ import {
   getChartIdAndColumnFromFilterKey,
   getDashboardFilterKey,
 } from './getDashboardFilterKey';
-import { CHART_TYPE } from '../util/componentTypes';
+import { CHART_TYPE } from './componentTypes';
 import { DASHBOARD_FILTER_SCOPE_GLOBAL } from '../reducers/dashboardFilters';
 
 let allFilterBoxChartIds = [];
@@ -33,7 +33,9 @@ let allComponents = {};
 
 // output: { [id_column]: { values, scope } }
 export function getActiveFilters() {
-  return activeFilters;
+  return {
+    ...activeFilters,
+  };
 }
 
 // currently filter_box is a chart,

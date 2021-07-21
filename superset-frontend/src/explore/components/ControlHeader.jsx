@@ -18,9 +18,11 @@
  */
 import React from 'react';
 import PropTypes from 'prop-types';
-import { t } from '@superset-ui/translation';
-import { ControlLabel, OverlayTrigger, Tooltip } from 'react-bootstrap';
-import InfoTooltipWithTrigger from '../../components/InfoTooltipWithTrigger';
+import { t, css, withTheme } from '@superset-ui/core';
+import { InfoTooltipWithTrigger } from '@superset-ui/chart-controls';
+import { Tooltip } from 'src/components/Tooltip';
+import { FormLabel } from 'src/components/Form';
+import Icons from 'src/components/Icons';
 
 const propTypes = {
   name: PropTypes.string,
@@ -44,11 +46,20 @@ const defaultProps = {
   name: undefined,
 };
 
-export default class ControlHeader extends React.Component {
+class ControlHeader extends React.Component {
   renderOptionalIcons() {
     if (this.props.hovered) {
       return (
-        <span>
+        <span
+          css={theme => css`
+            position: absolute;
+            top: 50%;
+            right: 0;
+            padding-left: ${theme.gridUnit}px;
+            transform: translate(100%, -50%);
+            white-space: nowrap;
+          `}
+        >
           {this.props.description && (
             <span>
               <InfoTooltipWithTrigger
@@ -74,18 +85,29 @@ export default class ControlHeader extends React.Component {
     }
     return null;
   }
+
   render() {
     if (!this.props.label) {
       return null;
     }
     const labelClass =
       this.props.validationErrors.length > 0 ? 'text-danger' : '';
+
+    const { theme } = this.props;
+
     return (
       <div className="ControlHeader" data-test={`${this.props.name}-header`}>
         <div className="pull-left">
-          <ControlLabel>
+          <FormLabel
+            css={{
+              marginBottom: 0,
+              position: 'relative',
+            }}
+          >
             {this.props.leftNode && <span>{this.props.leftNode}</span>}
             <span
+              role="button"
+              tabIndex={0}
               onClick={this.props.onClick}
               className={labelClass}
               style={{ cursor: this.props.onClick ? 'pointer' : '' }}
@@ -94,44 +116,48 @@ export default class ControlHeader extends React.Component {
             </span>{' '}
             {this.props.warning && (
               <span>
-                <OverlayTrigger
+                <Tooltip
+                  id="error-tooltip"
                   placement="top"
-                  overlay={
-                    <Tooltip id={'error-tooltip'}>{this.props.warning}</Tooltip>
-                  }
+                  title={this.props.warning}
                 >
-                  <i className="fa fa-exclamation-circle text-warning" />
-                </OverlayTrigger>{' '}
+                  <Icons.AlertSolid
+                    iconColor={theme.colors.alert.base}
+                    iconSize="s"
+                  />
+                </Tooltip>{' '}
               </span>
             )}
             {this.props.danger && (
               <span>
-                <OverlayTrigger
+                <Tooltip
+                  id="error-tooltip"
                   placement="top"
-                  overlay={
-                    <Tooltip id={'error-tooltip'}>{this.props.danger}</Tooltip>
-                  }
+                  title={this.props.danger}
                 >
-                  <i className="fa fa-exclamation-circle text-danger" />
-                </OverlayTrigger>{' '}
+                  <Icons.ErrorSolid
+                    iconColor={theme.colors.error.base}
+                    iconSize="s"
+                  />
+                </Tooltip>{' '}
               </span>
             )}
             {this.props.validationErrors.length > 0 && (
               <span>
-                <OverlayTrigger
+                <Tooltip
+                  id="error-tooltip"
                   placement="top"
-                  overlay={
-                    <Tooltip id={'error-tooltip'}>
-                      {this.props.validationErrors.join(' ')}
-                    </Tooltip>
-                  }
+                  title={this.props.validationErrors.join(' ')}
                 >
-                  <i className="fa fa-exclamation-circle text-danger" />
-                </OverlayTrigger>{' '}
+                  <Icons.ErrorSolid
+                    iconColor={theme.colors.error.base}
+                    iconSize="s"
+                  />
+                </Tooltip>{' '}
               </span>
             )}
             {this.renderOptionalIcons()}
-          </ControlLabel>
+          </FormLabel>
         </div>
         {this.props.rightNode && (
           <div className="pull-right">{this.props.rightNode}</div>
@@ -144,3 +170,5 @@ export default class ControlHeader extends React.Component {
 
 ControlHeader.propTypes = propTypes;
 ControlHeader.defaultProps = defaultProps;
+
+export default withTheme(ControlHeader);

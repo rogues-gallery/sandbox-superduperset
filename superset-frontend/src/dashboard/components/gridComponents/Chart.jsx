@@ -19,17 +19,22 @@
 import cx from 'classnames';
 import React from 'react';
 import PropTypes from 'prop-types';
-import { exportChart } from '../../../explore/exploreUtils';
-import SliceHeader from '../SliceHeader';
-import ChartContainer from '../../../chart/ChartContainer';
-import MissingChart from '../MissingChart';
-import { slicePropShape, chartPropShape } from '../../util/propShapes';
+import { styled } from '@superset-ui/core';
+
+import { exportChart, getExploreLongUrl } from 'src/explore/exploreUtils';
+import ChartContainer from 'src/chart/ChartContainer';
 import {
   LOG_ACTIONS_CHANGE_DASHBOARD_FILTER,
   LOG_ACTIONS_EXPLORE_DASHBOARD_CHART,
   LOG_ACTIONS_EXPORT_CSV_DASHBOARD_CHART,
   LOG_ACTIONS_FORCE_REFRESH_CHART,
-} from '../../../logger/LogUtils';
+} from 'src/logger/LogUtils';
+import { areObjectsEqual } from 'src/reduxUtils';
+
+import SliceHeader from '../SliceHeader';
+import MissingChart from '../MissingChart';
+import { slicePropShape, chartPropShape } from '../../util/propShapes';
+
 import { isFilterBox } from '../../util/activeDashboardFilters';
 import getFilterValuesByFilterId from '../../util/getFilterValuesByFilterId';
 
@@ -41,14 +46,16 @@ const propTypes = {
   height: PropTypes.number.isRequired,
   updateSliceName: PropTypes.func.isRequired,
   isComponentVisible: PropTypes.bool,
+  handleToggleFullSize: PropTypes.func.isRequired,
 
   // from redux
   chart: chartPropShape.isRequired,
   formData: PropTypes.object.isRequired,
-  datasource: PropTypes.object.isRequired,
+  datasource: PropTypes.object,
   slice: slicePropShape.isRequired,
   sliceName: PropTypes.string.isRequired,
   timeout: PropTypes.number.isRequired,
+  maxRows: PropTypes.number.isRequired,
   // all active filter fields in dashboard
   filters: PropTypes.object.isRequired,
   refreshChart: PropTypes.func.isRequired,
@@ -61,9 +68,13 @@ const propTypes = {
   isExpanded: PropTypes.bool.isRequired,
   isCached: PropTypes.bool,
   supersetCanExplore: PropTypes.bool.isRequired,
+  supersetCanShare: PropTypes.bool.isRequired,
   supersetCanCSV: PropTypes.bool.isRequired,
   sliceCanEdit: PropTypes.bool.isRequired,
+  addSuccessToast: PropTypes.func.isRequired,
   addDangerToast: PropTypes.func.isRequired,
+  ownState: PropTypes.object,
+  filterState: PropTypes.object,
 };
 
 const defaultProps = {
@@ -80,19 +91,27 @@ const SHOULD_UPDATE_ON_PROP_CHANGES = Object.keys(propTypes).filter(
 const OVERFLOWABLE_VIZ_TYPES = new Set(['filter_box']);
 const DEFAULT_HEADER_HEIGHT = 22;
 
-class Chart extends React.Component {
+const ChartOverlay = styled.div`
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 5;
+`;
+
+export default class Chart extends React.Component {
   constructor(props) {
     super(props);
     this.state = {
       width: props.width,
       height: props.height,
+      descriptionHeight: 0,
     };
 
     this.changeFilter = this.changeFilter.bind(this);
     this.handleFilterMenuOpen = this.handleFilterMenuOpen.bind(this);
     this.handleFilterMenuClose = this.handleFilterMenuClose.bind(this);
-    this.exploreChart = this.exploreChart.bind(this);
     this.exportCSV = this.exportCSV.bind(this);
+    this.exportFullCSV = this.exportFullCSV.bind(this);
     this.forceRefresh = this.forceRefresh.bind(this);
     this.resize = this.resize.bind(this);
     this.setDescriptionRef = this.setDescriptionRef.bind(this);
@@ -105,7 +124,9 @@ class Chart extends React.Component {
     // which improves performance significantly
     if (
       nextState.width !== this.state.width ||
-      nextState.height !== this.state.height
+      nextState.height !== this.state.height ||
+      nextState.descriptionHeight !== this.state.descriptionHeight ||
+      nextProps.datasource !== this.props.datasource
     ) {
       return true;
     }
@@ -117,11 +138,10 @@ class Chart extends React.Component {
         return true;
       }
 
-      for (let i = 0; i < SHOULD_UPDATE_ON_PROP_CHANGES.length; i += 1) {
-        const prop = SHOULD_UPDATE_ON_PROP_CHANGES[i];
-        if (nextProps[prop] !== this.props[prop]) {
-          return true;
-        }
+      if (nextProps.isFullSize !== this.props.isFullSize) {
+        clearTimeout(this.resizeTimeout);
+        this.resizeTimeout = setTimeout(this.resize, RESIZE_TIMEOUT);
+        return false;
       }
 
       if (
@@ -131,9 +151,18 @@ class Chart extends React.Component {
         clearTimeout(this.resizeTimeout);
         this.resizeTimeout = setTimeout(this.resize, RESIZE_TIMEOUT);
       }
+
+      for (let i = 0; i < SHOULD_UPDATE_ON_PROP_CHANGES.length; i += 1) {
+        const prop = SHOULD_UPDATE_ON_PROP_CHANGES[i];
+        // use deep objects equality comparison to prevent
+        // unneccessary updates when objects references change
+        if (!areObjectsEqual(nextProps[prop], this.props[prop])) {
+          return true;
+        }
+      }
     }
 
-    // `cacheBusterProp` is nnjected by react-hot-loader
+    // `cacheBusterProp` is jected by react-hot-loader
     return this.props.cacheBusterProp !== nextProps.cacheBusterProp;
   }
 
@@ -141,14 +170,20 @@ class Chart extends React.Component {
     clearTimeout(this.resizeTimeout);
   }
 
+  componentDidUpdate(prevProps) {
+    if (this.props.isExpanded !== prevProps.isExpanded) {
+      const descriptionHeight =
+        this.props.isExpanded && this.descriptionRef
+          ? this.descriptionRef.offsetHeight
+          : 0;
+      // eslint-disable-next-line react/no-did-update-set-state
+      this.setState({ descriptionHeight });
+    }
+  }
+
   getChartHeight() {
     const headerHeight = this.getHeaderHeight();
-    const descriptionHeight =
-      this.props.isExpanded && this.descriptionRef
-        ? this.descriptionRef.offsetHeight
-        : 0;
-
-    return this.state.height - headerHeight - descriptionHeight;
+    return this.state.height - headerHeight - this.state.descriptionHeight;
   }
 
   getHeaderHeight() {
@@ -182,24 +217,35 @@ class Chart extends React.Component {
     this.props.setFocusedFilterField(chartId, column);
   }
 
-  handleFilterMenuClose() {
-    this.props.unsetFocusedFilterField();
+  handleFilterMenuClose(chartId, column) {
+    this.props.unsetFocusedFilterField(chartId, column);
   }
 
-  exploreChart() {
+  logExploreChart = () => {
     this.props.logEvent(LOG_ACTIONS_EXPLORE_DASHBOARD_CHART, {
       slice_id: this.props.slice.slice_id,
       is_cached: this.props.isCached,
     });
-    exportChart(this.props.formData);
-  }
+  };
 
-  exportCSV() {
+  getChartUrl = () => getExploreLongUrl(this.props.formData);
+
+  exportCSV(isFullCSV = false) {
     this.props.logEvent(LOG_ACTIONS_EXPORT_CSV_DASHBOARD_CHART, {
       slice_id: this.props.slice.slice_id,
       is_cached: this.props.isCached,
     });
-    exportChart(this.props.formData, 'csv');
+    exportChart({
+      formData: isFullCSV
+        ? { ...this.props.formData, row_limit: this.props.maxRows }
+        : this.props.formData,
+      resultType: 'results',
+      resultFormat: 'csv',
+    });
+  }
+
+  exportFullCSV() {
+    this.exportCSV(true);
   }
 
   forceRefresh() {
@@ -231,22 +277,31 @@ class Chart extends React.Component {
       toggleExpandSlice,
       timeout,
       supersetCanExplore,
+      supersetCanShare,
       supersetCanCSV,
       sliceCanEdit,
+      addSuccessToast,
       addDangerToast,
+      ownState,
+      filterState,
+      handleToggleFullSize,
+      isFullSize,
     } = this.props;
 
     const { width } = this.state;
-
     // this prevents throwing in the case that a gridComponent
     // references a chart that is not associated with the dashboard
     if (!chart || !slice) {
       return <MissingChart height={this.getChartHeight()} />;
     }
 
-    const { queryResponse, chartUpdateEndTime } = chart;
-    const isCached = queryResponse && queryResponse.is_cached;
-    const cachedDttm = queryResponse && queryResponse.cached_dttm;
+    const { queriesResponse, chartUpdateEndTime, chartStatus } = chart;
+    const isLoading = chartStatus === 'loading';
+    // eslint-disable-next-line camelcase
+    const isCached = queriesResponse?.map(({ is_cached }) => is_cached) || [];
+    const cachedDttm =
+      // eslint-disable-next-line camelcase
+      queriesResponse?.map(({ cached_dttm }) => cached_dttm) || [];
     const isOverflowable = OVERFLOWABLE_VIZ_TYPES.has(slice.viz_type);
     const initialValues = isFilterBox(id)
       ? getFilterValuesByFilterId({
@@ -254,9 +309,14 @@ class Chart extends React.Component {
           filterId: id,
         })
       : {};
-
     return (
-      <div>
+      <div
+        className="chart-slice"
+        data-test="chart-grid-component"
+        data-test-chart-id={id}
+        data-test-viz-type={slice.viz_type}
+        data-test-chart-name={slice.slice_name}
+      >
         <SliceHeader
           innerRef={this.setHeaderRef}
           slice={slice}
@@ -268,25 +328,33 @@ class Chart extends React.Component {
           forceRefresh={this.forceRefresh}
           editMode={editMode}
           annotationQuery={chart.annotationQuery}
-          exploreChart={this.exploreChart}
+          logExploreChart={this.logExploreChart}
+          exploreUrl={this.getChartUrl()}
           exportCSV={this.exportCSV}
+          exportFullCSV={this.exportFullCSV}
           updateSliceName={updateSliceName}
           sliceName={sliceName}
           supersetCanExplore={supersetCanExplore}
+          supersetCanShare={supersetCanShare}
           supersetCanCSV={supersetCanCSV}
           sliceCanEdit={sliceCanEdit}
           componentId={componentId}
           dashboardId={dashboardId}
           filters={filters}
+          addSuccessToast={addSuccessToast}
           addDangerToast={addDangerToast}
+          handleToggleFullSize={handleToggleFullSize}
+          isFullSize={isFullSize}
+          chartStatus={chart.chartStatus}
+          formData={formData}
         />
 
         {/*
           This usage of dangerouslySetInnerHTML is safe since it is being used to render
           markdown that is sanitized with bleach. See:
-             https://github.com/apache/incubator-superset/pull/4390
+             https://github.com/apache/superset/pull/4390
           and
-             https://github.com/apache/incubator-superset/commit/b6fcc22d5a2cb7a5e92599ed5795a0169385a825
+             https://github.com/apache/superset/commit/b6fcc22d5a2cb7a5e92599ed5795a0169385a825
         */}
         {isExpanded && slice.description_markeddown && (
           <div
@@ -303,6 +371,15 @@ class Chart extends React.Component {
             isOverflowable && 'dashboard-chart--overflowable',
           )}
         >
+          {isLoading && (
+            <ChartOverlay
+              style={{
+                width,
+                height: this.getChartHeight(),
+              }}
+            />
+          )}
+
           <ChartContainer
             width={width}
             height={this.getChartHeight()}
@@ -312,12 +389,14 @@ class Chart extends React.Component {
             annotationData={chart.annotationData}
             chartAlert={chart.chartAlert}
             chartId={id}
-            chartStatus={chart.chartStatus}
+            chartStatus={chartStatus}
             datasource={datasource}
             dashboardId={dashboardId}
             initialValues={initialValues}
             formData={formData}
-            queryResponse={chart.queryResponse}
+            ownState={ownState}
+            filterState={filterState}
+            queriesResponse={chart.queriesResponse}
             timeout={timeout}
             triggerQuery={chart.triggerQuery}
             vizType={slice.viz_type}
@@ -330,5 +409,3 @@ class Chart extends React.Component {
 
 Chart.propTypes = propTypes;
 Chart.defaultProps = defaultProps;
-
-export default Chart;

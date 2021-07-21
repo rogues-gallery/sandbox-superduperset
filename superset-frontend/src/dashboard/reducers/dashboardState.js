@@ -34,11 +34,17 @@ import {
   SET_REFRESH_FREQUENCY,
   SET_DIRECT_PATH,
   SET_FOCUSED_FILTER_FIELD,
+  UNSET_FOCUSED_FILTER_FIELD,
+  SET_ACTIVE_TABS,
+  SET_FULL_SIZE_CHART_ID,
 } from '../actions/dashboardState';
-import { BUILDER_PANE_TYPE } from '../util/constants';
+import { HYDRATE_DASHBOARD } from '../actions/hydrate';
 
 export default function dashboardStateReducer(state = {}, action) {
   const actionHandlers = {
+    [HYDRATE_DASHBOARD]() {
+      return { ...state, ...action.data.dashboardState };
+    },
     [UPDATE_CSS]() {
       return { ...state, css: action.css };
     },
@@ -51,7 +57,7 @@ export default function dashboardStateReducer(state = {}, action) {
       };
     },
     [REMOVE_SLICE]() {
-      const sliceId = action.sliceId;
+      const { sliceId } = action;
       const updatedSliceIds = new Set(state.sliceIds);
       updatedSliceIds.delete(sliceId);
 
@@ -70,9 +76,6 @@ export default function dashboardStateReducer(state = {}, action) {
       return {
         ...state,
         editMode: action.editMode,
-        builderPaneType: action.editMode
-          ? BUILDER_PANE_TYPE.ADD_COMPONENTS
-          : BUILDER_PANE_TYPE.NONE,
       };
     },
     [SET_MAX_UNDO_HISTORY_EXCEEDED]() {
@@ -80,7 +83,7 @@ export default function dashboardStateReducer(state = {}, action) {
       return { ...state, maxUndoHistoryExceeded };
     },
     [SHOW_BUILDER_PANE]() {
-      return { ...state, builderPaneType: action.builderPaneType };
+      return { ...state };
     },
     [SET_COLOR_SCHEME]() {
       return {
@@ -91,7 +94,7 @@ export default function dashboardStateReducer(state = {}, action) {
     },
     [TOGGLE_EXPAND_SLICE]() {
       const updatedExpandedSlices = { ...state.expandedSlices };
-      const sliceId = action.sliceId;
+      const { sliceId } = action;
       if (updatedExpandedSlices[sliceId]) {
         delete updatedExpandedSlices[sliceId];
       } else {
@@ -108,8 +111,9 @@ export default function dashboardStateReducer(state = {}, action) {
         hasUnsavedChanges: false,
         maxUndoHistoryExceeded: false,
         editMode: false,
-        builderPaneType: BUILDER_PANE_TYPE.NONE,
         updatedColorScheme: false,
+        // server-side returns last_modified_time for latest change
+        lastModifiedTime: action.lastModifiedTime,
       };
     },
     [SET_UNSAVED_CHANGES]() {
@@ -120,6 +124,7 @@ export default function dashboardStateReducer(state = {}, action) {
       return {
         ...state,
         refreshFrequency: action.refreshFrequency,
+        shouldPersistRefreshFrequency: action.isPersistent,
         hasUnsavedChanges: action.isPersistent,
       };
     },
@@ -130,19 +135,41 @@ export default function dashboardStateReducer(state = {}, action) {
         directPathLastUpdated: Date.now(),
       };
     },
+    [SET_ACTIVE_TABS]() {
+      return {
+        ...state,
+        activeTabs: action.tabIds,
+      };
+    },
     [SET_FOCUSED_FILTER_FIELD]() {
-      const { focusedFilterField } = state;
-      if (action.chartId && action.column) {
-        focusedFilterField.push({
+      return {
+        ...state,
+        focusedFilterField: {
           chartId: action.chartId,
           column: action.column,
-        });
-      } else {
-        focusedFilterField.shift();
+        },
+      };
+    },
+    [UNSET_FOCUSED_FILTER_FIELD]() {
+      // dashboard only has 1 focused filter field at a time,
+      // but when user switch different filter boxes,
+      // browser didn't always fire onBlur and onFocus events in order.
+      if (
+        !state.focusedFilterField ||
+        action.chartId !== state.focusedFilterField.chartId ||
+        action.column !== state.focusedFilterField.column
+      ) {
+        return state;
       }
       return {
         ...state,
-        focusedFilterField,
+        focusedFilterField: null,
+      };
+    },
+    [SET_FULL_SIZE_CHART_ID]() {
+      return {
+        ...state,
+        fullSizeChartId: action.chartId,
       };
     },
   };

@@ -16,7 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import getFilterConfigsFromFormdata from '../../../../src/dashboard/util/getFilterConfigsFromFormdata';
+import getFilterConfigsFromFormdata from 'src/dashboard/util/getFilterConfigsFromFormdata';
 
 describe('getFilterConfigsFromFormdata', () => {
   const testFormdata = {
@@ -56,13 +56,25 @@ describe('getFilterConfigsFromFormdata', () => {
     });
   });
 
-  it('should use default value from form_data', () => {
+  it('should use default value and treat empty defaults as null', () => {
     const result = getFilterConfigsFromFormdata({
       ...testFormdata,
       show_sqla_time_column: true,
+      filter_configs: [
+        ...testFormdata.filter_configs,
+        {
+          asc: false,
+          clearable: true,
+          column: 'country',
+          defaultValue: '',
+          key: 'foo',
+          multiple: true,
+        },
+      ],
     });
     expect(result.columns).toMatchObject({
       state: ['CA'],
+      country: null,
     });
   });
 

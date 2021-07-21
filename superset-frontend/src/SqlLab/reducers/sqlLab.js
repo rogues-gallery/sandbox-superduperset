@@ -16,7 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { t } from '@superset-ui/translation';
+import { t } from '@superset-ui/core';
 
 import getInitialState from './getInitialState';
 import * as actions from '../actions/sqlLab';
@@ -324,16 +324,19 @@ export default function sqlLabReducer(state = {}, action) {
       });
     },
     [actions.QUERY_SUCCESS]() {
-      let rows;
-      if (action.results.data) {
-        rows = action.results.data.length;
+      // prevent race condition were query succeeds shortly after being canceled
+      if (action.query.state === 'stopped') {
+        return state;
       }
       const alts = {
         endDttm: now(),
         progress: 100,
         results: action.results,
-        rows,
+        rows: action?.results?.data?.length,
         state: 'success',
+        limitingFactor: action?.results?.query?.limitingFactor,
+        tempSchema: action?.results?.query?.tempSchema,
+        tempTable: action?.results?.query?.tempTable,
         errorMessage: null,
         cached: false,
       };
@@ -345,6 +348,7 @@ export default function sqlLabReducer(state = {}, action) {
       }
       const alts = {
         state: 'failed',
+        errors: action.errors,
         errorMessage: action.msg,
         endDttm: now(),
         link: action.link,
@@ -376,7 +380,7 @@ export default function sqlLabReducer(state = {}, action) {
     },
     [actions.MIGRATE_QUERY_EDITOR]() {
       // remove migrated query editor from localStorage
-      const sqlLab = JSON.parse(localStorage.getItem('redux')).sqlLab;
+      const { sqlLab } = JSON.parse(localStorage.getItem('redux'));
       sqlLab.queryEditors = sqlLab.queryEditors.filter(
         qe => qe.id !== action.oldQueryEditor.id,
       );
@@ -391,7 +395,7 @@ export default function sqlLabReducer(state = {}, action) {
     },
     [actions.MIGRATE_TABLE]() {
       // remove migrated table from localStorage
-      const sqlLab = JSON.parse(localStorage.getItem('redux')).sqlLab;
+      const { sqlLab } = JSON.parse(localStorage.getItem('redux'));
       sqlLab.tables = sqlLab.tables.filter(
         table => table.id !== action.oldTable.id,
       );
@@ -406,7 +410,7 @@ export default function sqlLabReducer(state = {}, action) {
     },
     [actions.MIGRATE_TAB_HISTORY]() {
       // remove migrated tab from localStorage tabHistory
-      const sqlLab = JSON.parse(localStorage.getItem('redux')).sqlLab;
+      const { sqlLab } = JSON.parse(localStorage.getItem('redux'));
       sqlLab.tabHistory = sqlLab.tabHistory.filter(
         tabId => tabId !== action.oldId,
       );
@@ -429,6 +433,11 @@ export default function sqlLabReducer(state = {}, action) {
     [actions.QUERY_EDITOR_SETDB]() {
       return alterInArr(state, 'queryEditors', action.queryEditor, {
         dbId: action.dbId,
+      });
+    },
+    [actions.QUERY_EDITOR_SET_FUNCTION_NAMES]() {
+      return alterInArr(state, 'queryEditors', action.queryEditor, {
+        functionNames: action.functionNames,
       });
     },
     [actions.QUERY_EDITOR_SET_SCHEMA]() {
@@ -482,10 +491,18 @@ export default function sqlLabReducer(state = {}, action) {
         southPercent: action.southPercent,
       });
     },
+    [actions.QUERY_EDITOR_TOGGLE_LEFT_BAR]() {
+      return alterInArr(state, 'queryEditors', action.queryEditor, {
+        hideLeftBar: action.hideLeftBar,
+      });
+    },
     [actions.SET_DATABASES]() {
       const databases = {};
       action.databases.forEach(db => {
-        databases[db.id] = db;
+        databases[db.id] = {
+          ...db,
+          extra_json: JSON.parse(db.extra || ''),
+        };
       });
       return { ...state, databases };
     },
@@ -493,9 +510,8 @@ export default function sqlLabReducer(state = {}, action) {
       let newQueries = { ...state.queries };
       // Fetch the updates to the queries present in the store.
       let change = false;
-      let queriesLastUpdate = state.queriesLastUpdate;
-      for (const id in action.alteredQueries) {
-        const changedQuery = action.alteredQueries[id];
+      let { queriesLastUpdate } = state;
+      Object.entries(action.alteredQueries).forEach(([id, changedQuery]) => {
         if (
           !state.queries.hasOwnProperty(id) ||
           (state.queries[id].state !== 'stopped' &&
@@ -507,7 +523,7 @@ export default function sqlLabReducer(state = {}, action) {
           newQueries[id] = { ...state.queries[id], ...changedQuery };
           change = true;
         }
-      }
+      });
       if (!change) {
         newQueries = state.queries;
       }

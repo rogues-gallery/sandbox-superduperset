@@ -19,6 +19,7 @@
 import { bindActionCreators } from 'redux';
 import { connect } from 'react-redux';
 
+import { updateDataMask } from 'src/dataMask/actions';
 import DashboardHeader from '../components/Header';
 import isDashboardLoading from '../util/isDashboardLoading';
 
@@ -30,6 +31,7 @@ import {
   fetchFaveStar,
   saveFaveStar,
   savePublished,
+  setColorSchemeAndUnsavedChanges,
   fetchCharts,
   updateCss,
   onChange,
@@ -60,6 +62,8 @@ function mapStateToProps({
   dashboardState,
   dashboardInfo,
   charts,
+  dataMask,
+  user,
 }) {
   return {
     dashboardInfo,
@@ -71,18 +75,25 @@ function mapStateToProps({
     ).text,
     expandedSlices: dashboardState.expandedSlices,
     refreshFrequency: dashboardState.refreshFrequency,
-    css: dashboardState.css,
+    shouldPersistRefreshFrequency: !!dashboardState.shouldPersistRefreshFrequency,
+    customCss: dashboardState.css,
     colorNamespace: dashboardState.colorNamespace,
     colorScheme: dashboardState.colorScheme,
     charts,
-    userId: dashboardInfo.userId,
+    dataMask,
+    userId: user.userId,
     isStarred: !!dashboardState.isStarred,
     isPublished: !!dashboardState.isPublished,
     isLoading: isDashboardLoading(charts),
     hasUnsavedChanges: !!dashboardState.hasUnsavedChanges,
     maxUndoHistoryExceeded: !!dashboardState.maxUndoHistoryExceeded,
+    lastModifiedTime: Math.max(
+      dashboardState.lastModifiedTime,
+      dashboardInfo.last_modified_time,
+    ),
     editMode: !!dashboardState.editMode,
-    builderPaneType: dashboardState.builderPaneType,
+    slug: dashboardInfo.slug,
+    metadata: dashboardInfo.metadata,
   };
 }
 
@@ -96,6 +107,7 @@ function mapDispatchToProps(dispatch) {
       onRedo: redoLayoutAction,
       setEditMode,
       showBuilderPane,
+      setColorSchemeAndUnsavedChanges,
       fetchFaveStar,
       saveFaveStar,
       savePublished,
@@ -110,6 +122,7 @@ function mapDispatchToProps(dispatch) {
       setRefreshFrequency,
       dashboardInfoChanged,
       dashboardTitleChanged,
+      updateDataMask,
     },
     dispatch,
   );
