@@ -16,12 +16,11 @@
 # under the License.
 from flask_babel import lazy_gettext as _
 
-from ..base import check_ownership
-from .filters import DashboardFilter
+from superset import security_manager
+from superset.dashboards.filters import DashboardAccessFilter
 
 
 class DashboardMixin:  # pylint: disable=too-few-public-methods
-
     list_title = _("Dashboards")
     show_title = _("Show Dashboard")
     add_title = _("Add Dashboard")
@@ -32,14 +31,14 @@ class DashboardMixin:  # pylint: disable=too-few-public-methods
     edit_columns = [
         "dashboard_title",
         "slug",
-        "owners",
+        "editors",
         "position_json",
         "css",
         "json_metadata",
         "published",
     ]
-    show_columns = edit_columns + ["table_names", "charts"]
-    search_columns = ("dashboard_title", "slug", "owners", "published")
+    show_columns = edit_columns + ["charts"]
+    search_columns = ("dashboard_title", "slug", "editors", "published")
     add_columns = edit_columns
     base_order = ("changed_on", "desc")
     description_columns = {
@@ -61,26 +60,27 @@ class DashboardMixin:  # pylint: disable=too-few-public-methods
             "is exposed here for reference and for power users who may "
             "want to alter specific parameters."
         ),
-        "owners": _("Owners is a list of users who can alter the dashboard."),
+        "editors": _("Editors is a list of subjects who can alter the dashboard."),
         "published": _(
             "Determines whether or not this dashboard is "
             "visible in the list of all dashboards"
         ),
     }
-    base_filters = [["slice", DashboardFilter, lambda: []]]
+    base_filters = [["slice", DashboardAccessFilter, lambda: []]]
     label_columns = {
         "dashboard_link": _("Dashboard"),
         "dashboard_title": _("Title"),
+        # i18n: the short identifier in a dashboard's URL, not the animal
         "slug": _("Slug"),
         "charts": _("Charts"),
-        "owners": _("Owners"),
+        "editors": _("Editors"),
+        "published": _("Published"),
         "creator": _("Creator"),
         "modified": _("Modified"),
         "position_json": _("Position JSON"),
         "css": _("CSS"),
         "json_metadata": _("JSON Metadata"),
-        "table_names": _("Underlying Tables"),
     }
 
-    def pre_delete(self, item):  # pylint: disable=no-self-use
-        check_ownership(item)
+    def pre_delete(self, item: "DashboardMixin") -> None:
+        security_manager.raise_for_editorship(item)

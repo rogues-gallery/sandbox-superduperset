@@ -14,65 +14,83 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""Loads datasets, dashboards and slices in a new superset instance"""
-import json
+import logging
 import os
-import textwrap
 
 import pandas as pd
-from sqlalchemy import DateTime, String
+from flask import current_app
+from sqlalchemy import DateTime, inspect, String
 from sqlalchemy.sql import column
 
+import superset.utils.database
 from superset import db
-from superset.connectors.sqla.models import SqlMetric
-from superset.models.dashboard import Dashboard
-from superset.models.slice import Slice
-from superset.utils import core as utils
-
-from .helpers import (
-    config,
-    EXAMPLES_FOLDER,
-    get_example_data,
+from superset.connectors.sqla.models import BaseDatasource, SqlMetric
+from superset.examples.helpers import (
+    get_examples_folder,
     get_slice_json,
+    get_table_connector_registry,
     merge_slice,
     misc_dash_slices,
-    TBL,
+    read_example_data,
     update_slice_ids,
 )
+from superset.models.dashboard import Dashboard
+from superset.models.slice import Slice
+from superset.sql.parse import Table
+from superset.utils import core as utils, json
+from superset.utils.core import DatasourceType
+
+logger = logging.getLogger(__name__)
 
 
 def load_world_bank_health_n_pop(  # pylint: disable=too-many-locals
-    only_metadata: bool = False, force: bool = False
+    only_metadata: bool = False,
+    force: bool = False,
+    sample: bool = False,
 ) -> None:
     """Loads the world bank health dataset, slices and a dashboard"""
     tbl_name = "wb_health_population"
-    database = utils.get_example_database()
-    table_exists = database.has_table_by_name(tbl_name)
+    database = superset.utils.database.get_example_database()
+    with database.get_sqla_engine() as engine:
+        schema = inspect(engine).default_schema_name
+        table_exists = database.has_table(Table(tbl_name, schema))
 
-    if not only_metadata and (not table_exists or force):
-        data = get_example_data("countries.json.gz")
-        pdf = pd.read_json(data)
-        pdf.columns = [col.replace(".", "_") for col in pdf.columns]
-        pdf.year = pd.to_datetime(pdf.year)
-        pdf.to_sql(
-            tbl_name,
-            database.get_sqla_engine(),
-            if_exists="replace",
-            chunksize=50,
-            dtype={
-                "year": DateTime(),
-                "country_code": String(3),
-                "country_name": String(255),
-                "region": String(255),
-            },
-            index=False,
-        )
+        if not only_metadata and (not table_exists or force):
+            pdf = read_example_data("examples://countries.json.gz", compression="gzip")
+            pdf.columns = [col.replace(".", "_") for col in pdf.columns]
+            if database.backend == "presto":
+                pdf.year = pd.to_datetime(pdf.year)
+                pdf.year = pdf.year.dt.strftime("%Y-%m-%d %H:%M%:%S")
+            else:
+                pdf.year = pd.to_datetime(pdf.year)
+            pdf = pdf.head(100) if sample else pdf
 
-    print("Creating table [wb_health_population] reference")
-    tbl = db.session.query(TBL).filter_by(table_name=tbl_name).first()
+            pdf.to_sql(
+                tbl_name,
+                engine,
+                schema=schema,
+                if_exists="replace",
+                chunksize=50,
+                dtype={
+                    # TODO(bkyryliuk): use TIMESTAMP type for presto
+                    "year": DateTime if database.backend != "presto" else String(255),
+                    "country_code": String(3),
+                    "country_name": String(255),
+                    "region": String(255),
+                },
+                method="multi",
+                index=False,
+            )
+
+    logger.debug("Creating table [wb_health_population] reference")
+    table = get_table_connector_registry()
+    tbl = db.session.query(table).filter_by(table_name=tbl_name).first()
     if not tbl:
-        tbl = TBL(table_name=tbl_name)
-    tbl.description = utils.readfile(os.path.join(EXAMPLES_FOLDER, "countries.md"))
+        tbl = table(table_name=tbl_name, schema=schema)
+        db.session.add(tbl)
+    tbl.description = utils.readfile(
+        os.path.join(get_examples_folder(), "countries.md")
+    )
     tbl.main_dttm_col = "year"
     tbl.database = database
     tbl.filter_select_enabled = True
@@ -89,14 +107,36 @@ def load_world_bank_health_n_pop(  # pylint: disable=too-many-locals
         if not any(col.metric_name == metric for col in tbl.metrics):
             aggr_func = metric[:3]
             col = str(column(metric[5:]).compile(db.engine))
-            tbl.metrics.append(
-                SqlMetric(metric_name=metric, expression=f"{aggr_func}({col})")
-            )
+            metric_it = SqlMetric(metric_name=metric, expression=f"{aggr_func}({col})")
+            db.session.add(metric_it)
+            tbl.metrics.append(metric_it)
 
-    db.session.merge(tbl)
-    db.session.commit()
     tbl.fetch_metadata()
 
+    slices = create_slices(tbl)
+    misc_dash_slices.add(slices[-1].slice_name)
+    for slc in slices:
+        merge_slice(slc)
+
+    logger.debug("Creating a World's Health Bank dashboard")
+    dash_name = "World Bank's Data"
+    slug = "world_health"
+    dash = db.session.query(Dashboard).filter_by(slug=slug).first()
+
+    if not dash:
+        dash = Dashboard()
+        db.session.add(dash)
+    dash.published = True
+    pos = dashboard_positions
+    slices = update_slice_ids(pos)
+
+    dash.dashboard_title = dash_name
+    dash.position_json = json.dumps(pos, indent=4)
+    dash.slug = slug
+    dash.slices = slices
+
+
+def create_slices(tbl: BaseDatasource) -> list[Slice]:
     metric = "sum__SP_POP_TOTL"
     metrics = ["sum__SP_POP_TOTL"]
     secondary_metric = {
@@ -110,14 +150,12 @@ def load_world_bank_health_n_pop(  # pylint: disable=too-many-locals
         "hasCustomLabel": True,
         "label": "Rural Population",
     }
-
-    defaults = {
+    shared_defaults = {
         "compare_lag": "10",
         "compare_suffix": "o10Y",
         "limit": "25",
-        "granularity_sqla": "year",
         "groupby": [],
-        "row_limit": config["ROW_LIMIT"],
+        "row_limit": current_app.config["ROW_LIMIT"],
         "since": "2014-01-01",
         "until": "2014-01-02",
         "time_range": "2014-01-01 : 2014-01-02",
@@ -126,45 +164,17 @@ def load_world_bank_health_n_pop(  # pylint: disable=too-many-locals
         "entity": "country_code",
         "show_bubbles": True,
     }
+    non_echarts_defaults = {**shared_defaults, "granularity": "year"}
+    echarts_x_axis_defaults = {**shared_defaults, "x_axis": "year"}
 
-    print("Creating slices")
-    slices = [
-        Slice(
-            slice_name="Region Filter",
-            viz_type="filter_box",
-            datasource_type="table",
-            datasource_id=tbl.id,
-            params=get_slice_json(
-                defaults,
-                viz_type="filter_box",
-                date_filter=False,
-                filter_configs=[
-                    {
-                        "asc": False,
-                        "clearable": True,
-                        "column": "region",
-                        "key": "2s98dfu",
-                        "metric": "sum__SP_POP_TOTL",
-                        "multiple": True,
-                    },
-                    {
-                        "asc": False,
-                        "clearable": True,
-                        "key": "li3j2lk",
-                        "column": "country_name",
-                        "metric": "sum__SP_POP_TOTL",
-                        "multiple": True,
-                    },
-                ],
-            ),
-        ),
+    return [
         Slice(
             slice_name="World's Population",
             viz_type="big_number",
-            datasource_type="table",
+            datasource_type=DatasourceType.TABLE,
             datasource_id=tbl.id,
             params=get_slice_json(
-                defaults,
+                non_echarts_defaults,
                 since="2000",
                 viz_type="big_number",
                 compare_lag="10",
@@ -175,10 +185,10 @@ def load_world_bank_health_n_pop(  # pylint: disable=too-many-locals
         Slice(
             slice_name="Most Populated Countries",
             viz_type="table",
-            datasource_type="table",
+            datasource_type=DatasourceType.TABLE,
             datasource_id=tbl.id,
             params=get_slice_json(
-                defaults,
+                non_echarts_defaults,
                 viz_type="table",
                 metrics=["sum__SP_POP_TOTL"],
                 groupby=["country_name"],
@@ -186,12 +196,12 @@ def load_world_bank_health_n_pop(  # pylint: disable=too-many-locals
         ),
         Slice(
             slice_name="Growth Rate",
-            viz_type="line",
-            datasource_type="table",
+            viz_type="echarts_timeseries_line",
+            datasource_type=DatasourceType.TABLE,
             datasource_id=tbl.id,
             params=get_slice_json(
-                defaults,
-                viz_type="line",
+                echarts_x_axis_defaults,
+                viz_type="echarts_timeseries_line",
                 since="1960-01-01",
                 metrics=["sum__SP_POP_TOTL"],
                 num_period_compare="10",
@@ -201,10 +211,10 @@ def load_world_bank_health_n_pop(  # pylint: disable=too-many-locals
         Slice(
             slice_name="% Rural",
             viz_type="world_map",
-            datasource_type="table",
+            datasource_type=DatasourceType.TABLE,
             datasource_id=tbl.id,
             params=get_slice_json(
-                defaults,
+                non_echarts_defaults,
                 viz_type="world_map",
                 metric="sum__SP_RUR_TOTL_ZS",
                 num_period_compare="10",
@@ -213,16 +223,16 @@ def load_world_bank_health_n_pop(  # pylint: disable=too-many-locals
         ),
         Slice(
             slice_name="Life Expectancy VS Rural %",
-            viz_type="bubble",
-            datasource_type="table",
+            viz_type="bubble_v2",
+            datasource_type=DatasourceType.TABLE,
             datasource_id=tbl.id,
             params=get_slice_json(
-                defaults,
-                viz_type="bubble",
+                non_echarts_defaults,
+                viz_type="bubble_v2",
                 since="2011-01-01",
                 until="2011-01-02",
                 series="region",
-                limit=0,
+                row_limit=0,
                 entity="country_name",
                 x="sum__SP_RUR_TOTL_ZS",
                 y="sum__SP_DYN_LE00_IN",
@@ -249,7 +259,7 @@ def load_world_bank_health_n_pop(  # pylint: disable=too-many-locals
                             "AMA",
                             "PLW",
                         ],
-                        "operator": "not in",
+                        "operator": "NOT IN",
                         "subject": "country_code",
                     }
                 ],
@@ -257,29 +267,29 @@ def load_world_bank_health_n_pop(  # pylint: disable=too-many-locals
         ),
         Slice(
             slice_name="Rural Breakdown",
-            viz_type="sunburst",
-            datasource_type="table",
+            viz_type="sunburst_v2",
+            datasource_type=DatasourceType.TABLE,
             datasource_id=tbl.id,
             params=get_slice_json(
-                defaults,
-                viz_type="sunburst",
-                groupby=["region", "country_name"],
+                non_echarts_defaults,
+                viz_type="sunburst_v2",
+                columns=["region", "country_name"],
                 since="2011-01-01",
-                until="2011-01-01",
+                until="2011-01-02",
                 metric=metric,
                 secondary_metric=secondary_metric,
             ),
         ),
         Slice(
             slice_name="World's Pop Growth",
-            viz_type="area",
-            datasource_type="table",
+            viz_type="echarts_area",
+            datasource_type=DatasourceType.TABLE,
             datasource_id=tbl.id,
             params=get_slice_json(
-                defaults,
+                echarts_x_axis_defaults,
                 since="1960-01-01",
                 until="now",
-                viz_type="area",
+                viz_type="echarts_area",
                 groupby=["region"],
                 metrics=metrics,
             ),
@@ -287,10 +297,10 @@ def load_world_bank_health_n_pop(  # pylint: disable=too-many-locals
         Slice(
             slice_name="Box plot",
             viz_type="box_plot",
-            datasource_type="table",
+            datasource_type=DatasourceType.TABLE,
             datasource_id=tbl.id,
             params=get_slice_json(
-                defaults,
+                non_echarts_defaults,
                 since="1960-01-01",
                 until="now",
                 whisker_options="Min/max (no outliers)",
@@ -302,27 +312,27 @@ def load_world_bank_health_n_pop(  # pylint: disable=too-many-locals
         ),
         Slice(
             slice_name="Treemap",
-            viz_type="treemap",
-            datasource_type="table",
+            viz_type="treemap_v2",
+            datasource_type=DatasourceType.TABLE,
             datasource_id=tbl.id,
             params=get_slice_json(
-                defaults,
+                non_echarts_defaults,
                 since="1960-01-01",
                 until="now",
-                viz_type="treemap",
-                metrics=["sum__SP_POP_TOTL"],
+                viz_type="treemap_v2",
+                metric="sum__SP_POP_TOTL",
                 groupby=["region", "country_code"],
             ),
         ),
         Slice(
             slice_name="Parallel Coordinates",
             viz_type="para",
-            datasource_type="table",
+            datasource_type=DatasourceType.TABLE,
             datasource_id=tbl.id,
             params=get_slice_json(
-                defaults,
+                non_echarts_defaults,
                 since="2011-01-01",
-                until="2011-01-01",
+                until="2012-01-01",
                 viz_type="para",
                 limit=100,
                 metrics=["sum__SP_POP_TOTL", "sum__SP_RUR_TOTL_ZS", "sum__SH_DYN_AIDS"],
@@ -331,42 +341,19 @@ def load_world_bank_health_n_pop(  # pylint: disable=too-many-locals
             ),
         ),
     ]
-    misc_dash_slices.add(slices[-1].slice_name)
-    for slc in slices:
-        merge_slice(slc)
 
-    print("Creating a World's Health Bank dashboard")
-    dash_name = "World Bank's Data"
-    slug = "world_health"
-    dash = db.session.query(Dashboard).filter_by(slug=slug).first()
 
-    if not dash:
-        dash = Dashboard()
-    dash.published = True
-    js = textwrap.dedent(
-        """\
-{
-    "CHART-36bfc934": {
-        "children": [],
-        "id": "CHART-36bfc934",
-        "meta": {
-            "chartId": 40,
-            "height": 25,
-            "sliceName": "Region Filter",
-            "width": 2
-        },
-        "type": "CHART"
-    },
+dashboard_positions = {
     "CHART-37982887": {
         "children": [],
         "id": "CHART-37982887",
         "meta": {
             "chartId": 41,
-            "height": 25,
+            "height": 52,
             "sliceName": "World's Population",
-            "width": 2
+            "width": 2,
         },
-        "type": "CHART"
+        "type": "CHART",
     },
     "CHART-17e0f8d8": {
         "children": [],
@@ -375,31 +362,21 @@ def load_world_bank_health_n_pop(  # pylint: disable=too-many-locals
             "chartId": 42,
             "height": 92,
             "sliceName": "Most Populated Countries",
-            "width": 3
+            "width": 3,
         },
-        "type": "CHART"
+        "type": "CHART",
     },
     "CHART-2ee52f30": {
         "children": [],
         "id": "CHART-2ee52f30",
-        "meta": {
-            "chartId": 43,
-            "height": 38,
-            "sliceName": "Growth Rate",
-            "width": 6
-        },
-        "type": "CHART"
+        "meta": {"chartId": 43, "height": 38, "sliceName": "Growth Rate", "width": 6},
+        "type": "CHART",
     },
     "CHART-2d5b6871": {
         "children": [],
         "id": "CHART-2d5b6871",
-        "meta": {
-            "chartId": 44,
-            "height": 52,
-            "sliceName": "% Rural",
-            "width": 7
-        },
-        "type": "CHART"
+        "meta": {"chartId": 44, "height": 52, "sliceName": "% Rural", "width": 7},
+        "type": "CHART",
     },
     "CHART-0fd0d252": {
         "children": [],
@@ -408,9 +385,9 @@ def load_world_bank_health_n_pop(  # pylint: disable=too-many-locals
             "chartId": 45,
             "height": 50,
             "sliceName": "Life Expectancy VS Rural %",
-            "width": 8
+            "width": 8,
         },
-        "type": "CHART"
+        "type": "CHART",
     },
     "CHART-97f4cb48": {
         "children": [],
@@ -419,9 +396,9 @@ def load_world_bank_health_n_pop(  # pylint: disable=too-many-locals
             "chartId": 46,
             "height": 38,
             "sliceName": "Rural Breakdown",
-            "width": 3
+            "width": 3,
         },
-        "type": "CHART"
+        "type": "CHART",
     },
     "CHART-b5e05d6f": {
         "children": [],
@@ -430,145 +407,74 @@ def load_world_bank_health_n_pop(  # pylint: disable=too-many-locals
             "chartId": 47,
             "height": 50,
             "sliceName": "World's Pop Growth",
-            "width": 4
+            "width": 4,
         },
-        "type": "CHART"
+        "type": "CHART",
     },
     "CHART-e76e9f5f": {
         "children": [],
         "id": "CHART-e76e9f5f",
-        "meta": {
-            "chartId": 48,
-            "height": 50,
-            "sliceName": "Box plot",
-            "width": 4
-        },
-        "type": "CHART"
+        "meta": {"chartId": 48, "height": 50, "sliceName": "Box plot", "width": 4},
+        "type": "CHART",
     },
     "CHART-a4808bba": {
         "children": [],
         "id": "CHART-a4808bba",
-        "meta": {
-            "chartId": 49,
-            "height": 50,
-            "sliceName": "Treemap",
-            "width": 8
-        },
-        "type": "CHART"
+        "meta": {"chartId": 49, "height": 50, "sliceName": "Treemap", "width": 8},
+        "type": "CHART",
     },
     "COLUMN-071bbbad": {
-        "children": [
-            "ROW-1e064e3c",
-            "ROW-afdefba9"
-        ],
+        "children": ["ROW-1e064e3c", "ROW-afdefba9"],
         "id": "COLUMN-071bbbad",
-        "meta": {
-            "background": "BACKGROUND_TRANSPARENT",
-            "width": 9
-        },
-        "type": "COLUMN"
+        "meta": {"background": "BACKGROUND_TRANSPARENT", "width": 9},
+        "type": "COLUMN",
     },
     "COLUMN-fe3914b8": {
-        "children": [
-            "CHART-36bfc934",
-            "CHART-37982887"
-        ],
+        "children": ["CHART-37982887"],
         "id": "COLUMN-fe3914b8",
-        "meta": {
-            "background": "BACKGROUND_TRANSPARENT",
-            "width": 2
-        },
-        "type": "COLUMN"
+        "meta": {"background": "BACKGROUND_TRANSPARENT", "width": 2},
+        "type": "COLUMN",
     },
     "GRID_ID": {
-        "children": [
-            "ROW-46632bc2",
-            "ROW-3fa26c5d",
-            "ROW-812b3f13"
-        ],
+        "children": ["ROW-46632bc2", "ROW-3fa26c5d", "ROW-812b3f13"],
         "id": "GRID_ID",
-        "type": "GRID"
+        "type": "GRID",
     },
     "HEADER_ID": {
         "id": "HEADER_ID",
-        "meta": {
-            "text": "World's Bank Data"
-        },
-        "type": "HEADER"
+        "meta": {"text": "World's Bank Data"},
+        "type": "HEADER",
     },
-    "ROOT_ID": {
-        "children": [
-            "GRID_ID"
-        ],
-        "id": "ROOT_ID",
-        "type": "ROOT"
-    },
+    "ROOT_ID": {"children": ["GRID_ID"], "id": "ROOT_ID", "type": "ROOT"},
     "ROW-1e064e3c": {
-        "children": [
-            "COLUMN-fe3914b8",
-            "CHART-2d5b6871"
-        ],
+        "children": ["COLUMN-fe3914b8", "CHART-2d5b6871"],
         "id": "ROW-1e064e3c",
-        "meta": {
-            "background": "BACKGROUND_TRANSPARENT"
-        },
-        "type": "ROW"
+        "meta": {"background": "BACKGROUND_TRANSPARENT"},
+        "type": "ROW",
     },
     "ROW-3fa26c5d": {
-        "children": [
-            "CHART-b5e05d6f",
-            "CHART-0fd0d252"
-        ],
+        "children": ["CHART-b5e05d6f", "CHART-0fd0d252"],
         "id": "ROW-3fa26c5d",
-        "meta": {
-            "background": "BACKGROUND_TRANSPARENT"
-        },
-        "type": "ROW"
+        "meta": {"background": "BACKGROUND_TRANSPARENT"},
+        "type": "ROW",
     },
     "ROW-46632bc2": {
-        "children": [
-            "COLUMN-071bbbad",
-            "CHART-17e0f8d8"
-        ],
+        "children": ["COLUMN-071bbbad", "CHART-17e0f8d8"],
         "id": "ROW-46632bc2",
-        "meta": {
-            "background": "BACKGROUND_TRANSPARENT"
-        },
-        "type": "ROW"
+        "meta": {"background": "BACKGROUND_TRANSPARENT"},
+        "type": "ROW",
     },
     "ROW-812b3f13": {
-        "children": [
-            "CHART-a4808bba",
-            "CHART-e76e9f5f"
-        ],
+        "children": ["CHART-a4808bba", "CHART-e76e9f5f"],
         "id": "ROW-812b3f13",
-        "meta": {
-            "background": "BACKGROUND_TRANSPARENT"
-        },
-        "type": "ROW"
+        "meta": {"background": "BACKGROUND_TRANSPARENT"},
+        "type": "ROW",
     },
     "ROW-afdefba9": {
-        "children": [
-            "CHART-2ee52f30",
-            "CHART-97f4cb48"
-        ],
+        "children": ["CHART-2ee52f30", "CHART-97f4cb48"],
         "id": "ROW-afdefba9",
-        "meta": {
-            "background": "BACKGROUND_TRANSPARENT"
-        },
-        "type": "ROW"
+        "meta": {"background": "BACKGROUND_TRANSPARENT"},
+        "type": "ROW",
     },
-    "DASHBOARD_VERSION_KEY": "v2"
+    "DASHBOARD_VERSION_KEY": "v2",
 }
-    """
-    )
-    pos = json.loads(js)
-    update_slice_ids(pos, slices)
-
-    dash.dashboard_title = dash_name
-    dash.position_json = json.dumps(pos, indent=4)
-    dash.slug = slug
-
-    dash.slices = slices[:-1]
-    db.session.merge(dash)
-    db.session.commit()

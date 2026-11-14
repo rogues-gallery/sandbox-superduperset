@@ -17,41 +17,33 @@
   under the License.
 -#}
 To: {{ receiver_email }}
-From: {{ sender_email }}
-Subject: [ANNOUNCE] Apache {{ project_name }} (Incubating) version {{ version }} Released
+
+Subject: [ANNOUNCE] Apache {{ project_name }} version {{ version }} released
 
 Hello Community,
 
-The Apache {{ project_name }} (incubating) team is pleased to announce that {{ project_name }}
+The Apache {{ project_name }} team is pleased to announce that {{ project_name }}
 {{ version }} has just been released.
 
 {{ project_description }}
 
 The official source release:
+https://downloads.apache.org/{{ project_module }}/{{ version }}
 
-https://www.apache.org/dist/incubator/{{ project_module }}/{{ version }}
+The PyPI package:
+https://pypi.org/project/apache_superset/{{ version }}
 
-The Pypi package:
+The CHANGELOG for the release:
+https://github.com/apache/{{ project_module }}/blob/{{ version }}/CHANGELOG/{{ version }}.md
 
-https://pypi.org/project/apache-superset/
+The instructions for updating to the release:
+https://github.com/apache/{{ project_module }}/blob/{{ version }}/UPDATING.md
 
-If you have any usage questions, or have problems when upgrading or
-find any problems about enhancements included in this release, please
+If you have any usage questions or have problems when upgrading or
+find any issues with enhancements included in this release, please
 don't hesitate to let us know by sending feedback to this mailing
 list.
 
-=====
-*Disclaimer*
-
-Apache {{ project_name }} is an effort undergoing incubation at The Apache Software
-Foundation (ASF), sponsored by the Incubator. Incubation is required of all
-newly accepted projects until a further review indicates that the
-infrastructure, communications, and decision making process have stabilized
-in a manner consistent with other successful ASF projects. While incubation
-status is not necessarily a reflection of the completeness or stability of
-the code, it does indicate that the project has yet to be fully endorsed by
-the ASF.
-
 ---------------------------------------------------------------------
-To unsubscribe, e-mail: general-unsubscribe@incubator.apache.org
-For additional commands, e-mail: general-help@incubator.apache.org
+To unsubscribe, e-mail: general-unsubscribe@apache.org
+For additional commands, e-mail: general-help@apache.org

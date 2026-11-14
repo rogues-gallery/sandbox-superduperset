@@ -14,25 +14,31 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-import logging
-import pickle as pkl
-from datetime import datetime, timedelta
-from typing import Any, ClassVar, Dict, List, Optional
+from __future__ import annotations
 
-import numpy as np
+import logging
+from typing import Any, ClassVar, TYPE_CHECKING
+
 import pandas as pd
 
-from superset import app, cache, db, security_manager
-from superset.connectors.base.models import BaseDatasource
-from superset.connectors.connector_registry import ConnectorRegistry
-from superset.stats_logger import BaseStatsLogger
-from superset.utils import core as utils
-from superset.utils.core import DTTM_ALIAS
+from superset.common.chart_data import ChartDataResultFormat, ChartDataResultType
+from superset.common.chart_data_timing import (
+    QueryAcquisitionResult,
+    QueryContextExecutionResult,
+)
+from superset.common.query_context_processor import (
+    normalize_contribution_totals,
+    QueryContextProcessor,
+)
+from superset.common.query_object import QueryObject
+from superset.explorables.base import Explorable
+from superset.models.slice import Slice
+from superset.utils.core import GenericDataType
 
-from .query_object import QueryObject
+if TYPE_CHECKING:
+    from superset.models.helpers import QueryResult
 
-config = app.config
-stats_logger: BaseStatsLogger = config["STATS_LOGGER"]
+
 logger = logging.getLogger(__name__)
 
 
@@ -45,208 +51,151 @@ class QueryContext:
     cache_type: ClassVar[str] = "df"
     enforce_numerical_metrics: ClassVar[bool] = True
 
-    datasource: BaseDatasource
-    queries: List[QueryObject]
+    datasource: Explorable
+    slice_: Slice | None = None
+    queries: list[QueryObject]
+    form_data: dict[str, Any] | None
+    result_type: ChartDataResultType
+    result_format: ChartDataResultFormat
     force: bool
-    custom_cache_timeout: Optional[int]
+    # Optional idempotency token for a forced refresh. Set once per user-initiated
+    # force refresh (Explore/Dashboard) and carried on every request of that
+    # refresh — the async submit and the follow-up read-back. The first execution
+    # to see it recomputes and records a per-(nonce, cache_key) marker; later
+    # requests carrying the same nonce read the freshly-cached result instead of
+    # recomputing it (see QueryContextProcessor.get_df_payload_result). Kept
+    # separate from the result cache key, so non-forced loads stay warm.
+    force_nonce: str | None
+    # Client-generated id for this chart query run, used only to make the query
+    # cancellable while it is running (see superset.tasks.query_cancel). It is
+    # untrusted input and deliberately kept out of the result cache key: it
+    # varies per run, so binding it would defeat the data cache entirely.
+    client_id: str | None
+    custom_cache_timeout: int | None
+
+    # Set by the async chart-data execution path (see
+    # superset.tasks.async_queries.execute_chart_query). The async flow caches a
+    # result and a follow-up request reads it back, so the result cache TTL is
+    # floored to GLOBAL_ASYNC_QUERIES_MIN_CACHE_TTL (see
+    # QueryContextProcessor.get_cache_timeout). Never set on the synchronous path.
+    is_async_execution: bool = False
+
+    cache_values: dict[str, Any]
+
+    _processor: QueryContextProcessor
 
     # TODO: Type datasource and query_object dictionary with TypedDict when it becomes
-    # a vanilla python type https://github.com/python/mypy/issues/5288
-    def __init__(
+    #  a vanilla python type https://github.com/python/mypy/issues/5288
+    def __init__(  # pylint: disable=too-many-arguments
         self,
-        datasource: Dict[str, Any],
-        queries: List[Dict[str, Any]],
+        *,
+        datasource: Explorable,
+        queries: list[QueryObject],
+        slice_: Slice | None,
+        form_data: dict[str, Any] | None,
+        result_type: ChartDataResultType,
+        result_format: ChartDataResultFormat,
         force: bool = False,
-        custom_cache_timeout: Optional[int] = None,
+        force_nonce: str | None = None,
+        client_id: str | None = None,
+        custom_cache_timeout: int | None = None,
+        cache_values: dict[str, Any],
     ) -> None:
-        self.datasource = ConnectorRegistry.get_datasource(
-            str(datasource["type"]), int(datasource["id"]), db.session
-        )
-        self.queries = [QueryObject(**query_obj) for query_obj in queries]
+        self.datasource = datasource
+        self.slice_ = slice_
+        self.result_type = result_type
+        self.result_format = result_format
+        self.queries = queries
+        self.form_data = form_data
         self.force = force
+        self.force_nonce = force_nonce
+        self.client_id = client_id
         self.custom_cache_timeout = custom_cache_timeout
+        self.cache_values = cache_values
+        # Normalize the contribution totals query before any cache key is
+        # computed. The return value is unused here; we only need the side
+        # effect on the totals query's row_limit.
+        self.prepare_contribution_totals()
+        self._processor = QueryContextProcessor(self)
 
-    def get_query_result(self, query_object: QueryObject) -> Dict[str, Any]:
-        """Returns a pandas dataframe based on the query object"""
+    def get_data(
+        self,
+        df: pd.DataFrame,
+        coltypes: list[GenericDataType],
+    ) -> str | bytes | list[dict[str, Any]]:
+        return self._processor.get_data(df, coltypes)
 
-        # Here, we assume that all the queries will use the same datasource, which is
-        # is a valid assumption for current setting. In a long term, we may or maynot
-        # support multiple queries from different data source.
+    def get_payload(
+        self,
+        cache_query_context: bool | None = False,
+        force_cached: bool = False,
+    ) -> dict[str, Any]:
+        """Returns the query results with both metadata and data"""
+        return self._processor.get_payload(cache_query_context, force_cached)
 
-        timestamp_format = None
-        if self.datasource.type == "table":
-            dttm_col = self.datasource.get_column(query_object.granularity)
-            if dttm_col:
-                timestamp_format = dttm_col.python_date_format
+    def get_payload_result(
+        self,
+        cache_query_context: bool | None = False,
+        force_cached: bool = False,
+    ) -> QueryContextExecutionResult:
+        """Return query results with timing kept outside query payloads."""
+        return self._processor.get_payload_result(cache_query_context, force_cached)
 
-        # The datasource here can be different backend but the interface is common
-        result = self.datasource.query(query_object.to_dict())
+    def get_cache_timeout(self) -> int | None:
+        """
+        Get the cache timeout for this query context.
 
-        df = result.df
-        # Transform the timestamp we received from database to pandas supported
-        # datetime format. If no python_date_format is specified, the pattern will
-        # be considered as the default ISO date format
-        # If the datetime format is unix, the parse will use the corresponding
-        # parsing logic
-        if not df.empty:
-            if DTTM_ALIAS in df.columns:
-                if timestamp_format in ("epoch_s", "epoch_ms"):
-                    # Column has already been formatted as a timestamp.
-                    df[DTTM_ALIAS] = df[DTTM_ALIAS].apply(pd.Timestamp)
-                else:
-                    df[DTTM_ALIAS] = pd.to_datetime(
-                        df[DTTM_ALIAS], utc=False, format=timestamp_format
-                    )
-                if self.datasource.offset:
-                    df[DTTM_ALIAS] += timedelta(hours=self.datasource.offset)
-                df[DTTM_ALIAS] += query_object.time_shift
+        Priority order:
+        1. Custom timeout set for this specific query
+        2. Chart-level timeout (if querying from a saved chart)
+        3. Datasource-level timeout (explorable handles its own fallback logic)
+        4. System default (None)
 
-            if self.enforce_numerical_metrics:
-                self.df_metrics_to_num(df, query_object)
-
-            df.replace([np.inf, -np.inf], np.nan)
-        return {
-            "query": result.query,
-            "status": result.status,
-            "error_message": result.error_message,
-            "df": df,
-        }
-
-    @staticmethod
-    def df_metrics_to_num(  # pylint: disable=no-self-use
-        df: pd.DataFrame, query_object: QueryObject
-    ) -> None:
-        """Converting metrics to numeric when pandas.read_sql cannot"""
-        for col, dtype in df.dtypes.items():
-            if dtype.type == np.object_ and col in query_object.metrics:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    @staticmethod
-    def get_data(df: pd.DataFrame,) -> List[Dict]:  # pylint: disable=no-self-use
-        return df.to_dict(orient="records")
-
-    def get_single_payload(self, query_obj: QueryObject) -> Dict[str, Any]:
-        """Returns a payload of metadata and data"""
-        payload = self.get_df_payload(query_obj)
-        df = payload["df"]
-        status = payload["status"]
-        if status != utils.QueryStatus.FAILED:
-            if df.empty:
-                payload["error"] = "No data"
-            else:
-                payload["data"] = self.get_data(df)
-        del payload["df"]
-        return payload
-
-    def get_payload(self) -> List[Dict[str, Any]]:
-        """Get all the payloads from the arrays"""
-        return [self.get_single_payload(query_object) for query_object in self.queries]
-
-    @property
-    def cache_timeout(self) -> int:
+        Note: Each explorable is responsible for its own internal fallback chain.
+        For example, BaseDatasource falls back to database.cache_timeout,
+        while semantic layers might fall back to their layer's default.
+        """
         if self.custom_cache_timeout is not None:
             return self.custom_cache_timeout
-        if self.datasource.cache_timeout is not None:
-            return self.datasource.cache_timeout
-        if (
-            hasattr(self.datasource, "database")
-            and self.datasource.database.cache_timeout
-        ) is not None:
-            return self.datasource.database.cache_timeout
-        return config["CACHE_DEFAULT_TIMEOUT"]
+        if self.slice_ and self.slice_.cache_timeout is not None:
+            return self.slice_.cache_timeout
+        return self.datasource.cache_timeout
 
-    def cache_key(self, query_obj: QueryObject, **kwargs: Any) -> Optional[str]:
-        extra_cache_keys = self.datasource.get_extra_cache_keys(query_obj.to_dict())
-        cache_key = (
-            query_obj.cache_key(
-                datasource=self.datasource.uid,
-                extra_cache_keys=extra_cache_keys,
-                rls=security_manager.get_rls_ids(self.datasource),
-                changed_on=self.datasource.changed_on,
-                **kwargs
-            )
-            if query_obj
-            else None
+    def query_cache_key(self, query_obj: QueryObject, **kwargs: Any) -> str | None:
+        return self._processor.query_cache_key(query_obj, **kwargs)
+
+    def prepare_contribution_totals(self) -> tuple[list[int], int | None]:
+        """Identify contribution queries and normalize the totals query.
+
+        Returns the indices of queries whose contribution post-processing needs a
+        shared totals row, and the index of the totals query itself (or ``None``).
+        The normalization is idempotent and runs at construction time as well.
+        """
+        return normalize_contribution_totals(self.queries, self.cache_values)
+
+    def get_df_payload(
+        self,
+        query_obj: QueryObject,
+        force_cached: bool | None = False,
+    ) -> dict[str, Any]:
+        return self._processor.get_df_payload(
+            query_obj=query_obj,
+            force_cached=force_cached,
         )
-        return cache_key
 
-    def get_df_payload(  # pylint: disable=too-many-locals,too-many-statements
-        self, query_obj: QueryObject, **kwargs: Any
-    ) -> Dict[str, Any]:
-        """Handles caching around the df payload retrieval"""
-        cache_key = self.cache_key(query_obj, **kwargs)
-        logger.info("Cache key: %s", cache_key)
-        is_loaded = False
-        stacktrace = None
-        df = pd.DataFrame()
-        cached_dttm = datetime.utcnow().isoformat().split(".")[0]
-        cache_value = None
-        status = None
-        query = ""
-        error_message = None
-        if cache_key and cache and not self.force:
-            cache_value = cache.get(cache_key)
-            if cache_value:
-                stats_logger.incr("loading_from_cache")
-                try:
-                    cache_value = pkl.loads(cache_value)
-                    df = cache_value["df"]
-                    query = cache_value["query"]
-                    status = utils.QueryStatus.SUCCESS
-                    is_loaded = True
-                    stats_logger.incr("loaded_from_cache")
-                except Exception as ex:  # pylint: disable=broad-except
-                    logger.exception(ex)
-                    logger.error(
-                        "Error reading cache: %s", utils.error_msg_from_exception(ex)
-                    )
-                logger.info("Serving from cache")
+    def get_df_payload_result(
+        self,
+        query_obj: QueryObject,
+        force_cached: bool | None = False,
+    ) -> QueryAcquisitionResult:
+        """Return dataframe payload with timing kept outside the payload."""
+        return self._processor.get_df_payload_result(
+            query_obj=query_obj,
+            force_cached=force_cached,
+        )
 
-        if query_obj and not is_loaded:
-            try:
-                query_result = self.get_query_result(query_obj)
-                status = query_result["status"]
-                query = query_result["query"]
-                error_message = query_result["error_message"]
-                df = query_result["df"]
-                if status != utils.QueryStatus.FAILED:
-                    stats_logger.incr("loaded_from_source")
-                    if not self.force:
-                        stats_logger.incr("loaded_from_source_without_force")
-                    is_loaded = True
-            except Exception as ex:  # pylint: disable=broad-except
-                logger.exception(ex)
-                if not error_message:
-                    error_message = "{}".format(ex)
-                status = utils.QueryStatus.FAILED
-                stacktrace = utils.get_stacktrace()
+    def get_query_result(self, query_object: QueryObject) -> QueryResult:
+        return self._processor.get_query_result(query_object)
 
-            if is_loaded and cache_key and cache and status != utils.QueryStatus.FAILED:
-                try:
-                    cache_value = dict(dttm=cached_dttm, df=df, query=query)
-                    cache_binary = pkl.dumps(cache_value, protocol=pkl.HIGHEST_PROTOCOL)
-
-                    logger.info(
-                        "Caching %d chars at key %s", len(cache_binary), cache_key
-                    )
-
-                    stats_logger.incr("set_cache_key")
-                    cache.set(cache_key, cache_binary, timeout=self.cache_timeout)
-                except Exception as ex:  # pylint: disable=broad-except
-                    # cache.set call can fail if the backend is down or if
-                    # the key is too large or whatever other reasons
-                    logger.warning("Could not cache key %s", cache_key)
-                    logger.exception(ex)
-                    cache.delete(cache_key)
-        return {
-            "cache_key": cache_key,
-            "cached_dttm": cache_value["dttm"] if cache_value is not None else None,
-            "cache_timeout": self.cache_timeout,
-            "df": df,
-            "error": error_message,
-            "is_cached": cache_key is not None,
-            "query": query,
-            "status": status,
-            "stacktrace": stacktrace,
-            "rowcount": len(df.index),
-        }
+    def raise_for_access(self) -> None:
+        self._processor.raise_for_access()

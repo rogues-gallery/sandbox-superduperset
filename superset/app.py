@@ -14,601 +14,255 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+from __future__ import annotations
 
 import logging
 import os
+from typing import cast, Iterable, Optional
+from wsgiref.types import StartResponse, WSGIApplication, WSGIEnvironment
 
-import wtforms_json
-from flask import Flask, redirect
-from flask_appbuilder import expose, IndexView
-from flask_babel import gettext as __, lazy_gettext as _
-from flask_compress import Compress
-from flask_wtf import CSRFProtect
+from alembic.config import Config
+from alembic.runtime.migration import MigrationContext
+from alembic.script import ScriptDirectory
+from flask import Flask, Response
+from werkzeug.exceptions import NotFound
 
-from superset.connectors.connector_registry import ConnectorRegistry
-from superset.extensions import (
-    _event_logger,
-    APP_DIR,
-    appbuilder,
-    cache_manager,
-    celery_app,
-    db,
-    feature_flag_manager,
-    jinja_context_manager,
-    manifest_processor,
-    migrate,
-    results_backend_manager,
-    talisman,
+from superset.extensions.cache_middleware import ExtensionCacheMiddleware
+from superset.extensions.local_extensions_watcher import (
+    start_local_extensions_watcher_thread,
 )
-from superset.security import SupersetSecurityManager
-from superset.utils.core import pessimistic_connection_handling
-from superset.utils.log import DBEventLogger, get_event_logger_from_cfg_value
+from superset.initialization import SupersetAppInitializer
+from superset.marshmallow_compatibility import patch_marshmallow_for_flask_appbuilder
+from superset.middleware.legacy_prefix_redirect import LegacyPrefixRedirectMiddleware
+
+patch_marshmallow_for_flask_appbuilder()
 
 logger = logging.getLogger(__name__)
 
 
-def create_app():
-    app = Flask(__name__)
+def create_app(
+    superset_config_module: Optional[str] = None,
+    superset_app_root: Optional[str] = None,
+) -> Flask:
+    app = SupersetApp(__name__)
 
     try:
         # Allow user to override our config completely
-        config_module = os.environ.get("SUPERSET_CONFIG", "superset.config")
+        config_module = superset_config_module or os.environ.get(
+            "SUPERSET_CONFIG", "superset.config"
+        )
         app.config.from_object(config_module)
+
+        # Allow application to sit on a non-root path
+        # *Please be advised that this feature is in BETA.*
+        app_root = cast(
+            str,
+            superset_app_root
+            or os.environ.get("SUPERSET_APP_ROOT")
+            or app.config["APPLICATION_ROOT"],
+        )
+        # Normalize once at the source: a trailing slash ("/myapp/") would
+        # otherwise leak into STATIC_ASSETS_PREFIX ("/myapp//static/...")
+        # and APPLICATION_ROOT (the session-cookie path). The middlewares
+        # below re-normalize defensively, but every consumer derives from
+        # this value.
+        app_root = app_root.rstrip("/") or "/"
+        if app_root != "/":
+            # If not set, manually configure options that depend on the
+            # value of app_root so things work out of the box
+            if not app.config["STATIC_ASSETS_PREFIX"]:
+                app.config["STATIC_ASSETS_PREFIX"] = app_root
+            # Prefix APP_ICON with the static assets prefix so the brand logo
+            # resolves in subdirectory and CDN deployments alike. Using
+            # STATIC_ASSETS_PREFIX (which defaults to app_root just above)
+            # honours a custom CDN/static prefix when the operator sets one.
+            if app.config.get("APP_ICON", "").startswith("/static/"):
+                app.config["APP_ICON"] = (
+                    f"{app.config['STATIC_ASSETS_PREFIX']}{app.config['APP_ICON']}"
+                )
+            if app.config["APPLICATION_ROOT"] == "/":
+                app.config["APPLICATION_ROOT"] = app_root
 
         app_initializer = app.config.get("APP_INITIALIZER", SupersetAppInitializer)(app)
         app_initializer.init_app()
 
+        # Must be applied before AppRootMiddleware so the path prefix
+        # is stripped before the extension asset path regex runs.
+        app.wsgi_app = ExtensionCacheMiddleware(app.wsgi_app)
+
+        if app_root != "/":
+            app.wsgi_app = AppRootMiddleware(app.wsgi_app, app_root)
+
+        # Final WSGI wrap — must be outermost so it sees the raw inbound
+        # PATH_INFO and 308s legacy `/superset/*` paths before any other
+        # routing runs. Unconditional (independent of `app_root != "/"`)
+        # because legacy bookmarks exist under root deployments too.
+        # See the "Layering invariant" section of the module docstring
+        # in `superset/middleware/legacy_prefix_redirect.py`.
+        # mypy reads `app.wsgi_app` as `object` after the conditional
+        # `AppRootMiddleware` rewrap above — the LUB of the two branches
+        # widens it. The runtime type is always a WSGI callable; the
+        # `# type: ignore` is intentional.
+        app.wsgi_app = LegacyPrefixRedirectMiddleware(
+            app.wsgi_app,  # type: ignore[arg-type]
+            app_root,
+        )
+
+        # Set up LOCAL_EXTENSIONS file watcher when in debug mode
+        if app.debug:
+            start_local_extensions_watcher_thread(app)
+
         return app
 
     # Make sure that bootstrap errors ALWAYS get logged
-    except Exception as ex:
+    except Exception:
         logger.exception("Failed to create app")
-        raise ex
+        raise
 
 
-class SupersetIndexView(IndexView):
-    @expose("/")
-    def index(self):
-        return redirect("/superset/welcome")
+class SupersetApp(Flask):
+    def send_static_file(self, filename: str) -> Response:
+        """Override to prevent webpack hot-update 404s from spamming logs.
 
-
-class SupersetAppInitializer:
-    def __init__(self, app: Flask) -> None:
-        super().__init__()
-
-        self.flask_app = app
-        self.config = app.config
-        self.manifest: dict = {}
-
-    def pre_init(self) -> None:
+        Webpack HMR can create race conditions where the browser requests
+        hot-update files that no longer exist. Return 204 instead of 404
+        for these files to keep logs clean.
         """
-        Called before all other init tasks are complete
-        """
-        wtforms_json.init()
-
-        if not os.path.exists(self.config["DATA_DIR"]):
-            os.makedirs(self.config["DATA_DIR"])
-
-    def post_init(self) -> None:
-        """
-        Called after any other init tasks
-        """
-        pass
-
-    def configure_celery(self) -> None:
-        celery_app.config_from_object(self.config["CELERY_CONFIG"])
-        celery_app.set_default()
-        flask_app = self.flask_app
-
-        # Here, we want to ensure that every call into Celery task has an app context
-        # setup properly
-        task_base = celery_app.Task
-
-        class AppContextTask(task_base):  # type: ignore
-            # pylint: disable=too-few-public-methods
-            abstract = True
-
-            # Grab each call into the task and set up an app context
-            def __call__(self, *args, **kwargs):
-                with flask_app.app_context():
-                    return task_base.__call__(self, *args, **kwargs)
-
-        celery_app.Task = AppContextTask
-
-    def init_views(self) -> None:
-        #
-        # We're doing local imports, as several of them import
-        # models which in turn try to import
-        # the global Flask app
-        #
-        # pylint: disable=too-many-locals
-        # pylint: disable=too-many-statements
-        from superset.connectors.druid.views import (
-            DruidDatasourceModelView,
-            DruidClusterModelView,
-            DruidMetricInlineView,
-            DruidColumnInlineView,
-            Druid,
-        )
-        from superset.datasets.api import DatasetRestApi
-        from superset.queries.api import QueryRestApi
-        from superset.connectors.sqla.views import (
-            TableColumnInlineView,
-            SqlMetricInlineView,
-            TableModelView,
-            RowLevelSecurityFiltersModelView,
-        )
-        from superset.views.annotations import (
-            AnnotationLayerModelView,
-            AnnotationModelView,
-        )
-        from superset.views.api import Api
-        from superset.views.core import (
-            AccessRequestsModelView,
-            KV,
-            R,
-            Superset,
-            CssTemplateModelView,
-            CssTemplateAsyncModelView,
-        )
-        from superset.charts.api import ChartRestApi
-        from superset.views.chart.views import SliceModelView, SliceAsync
-        from superset.dashboards.api import DashboardRestApi
-        from superset.views.dashboard.views import (
-            DashboardModelView,
-            Dashboard,
-            DashboardModelViewAsync,
-        )
-        from superset.views.database.api import DatabaseRestApi
-        from superset.views.database.views import DatabaseView, CsvToDatabaseView
-        from superset.views.datasource import Datasource
-        from superset.views.log.api import LogRestApi
-        from superset.views.log.views import LogModelView
-        from superset.views.schedules import (
-            DashboardEmailScheduleView,
-            SliceEmailScheduleView,
-        )
-        from superset.views.sql_lab import (
-            QueryView,
-            SavedQueryViewApi,
-            SavedQueryView,
-            TabStateView,
-            TableSchemaView,
-            SqlLab,
-        )
-        from superset.views.tags import TagView
-
-        #
-        # Setup API views
-        #
-        appbuilder.add_api(ChartRestApi)
-        appbuilder.add_api(DashboardRestApi)
-        appbuilder.add_api(DatabaseRestApi)
-        appbuilder.add_api(DatasetRestApi)
-        appbuilder.add_api(QueryRestApi)
-        #
-        # Setup regular views
-        #
-        appbuilder.add_view(
-            AnnotationLayerModelView,
-            "Annotation Layers",
-            label=__("Annotation Layers"),
-            icon="fa-comment",
-            category="Manage",
-            category_label=__("Manage"),
-            category_icon="",
-        )
-        appbuilder.add_view(
-            AnnotationModelView,
-            "Annotations",
-            label=__("Annotations"),
-            icon="fa-comments",
-            category="Manage",
-            category_label=__("Manage"),
-            category_icon="",
-        )
-        appbuilder.add_view(
-            DatabaseView,
-            "Databases",
-            label=__("Databases"),
-            icon="fa-database",
-            category="Sources",
-            category_label=__("Sources"),
-            category_icon="fa-database",
-        )
-        appbuilder.add_link(
-            "Tables",
-            label=__("Tables"),
-            href="/tablemodelview/list/?_flt_1_is_sqllab_view=y",
-            icon="fa-table",
-            category="Sources",
-            category_label=__("Sources"),
-            category_icon="fa-table",
-        )
-        appbuilder.add_separator("Sources")
-        appbuilder.add_view(
-            SliceModelView,
-            "Charts",
-            label=__("Charts"),
-            icon="fa-bar-chart",
-            category="",
-            category_icon="",
-        )
-        appbuilder.add_view(
-            DashboardModelView,
-            "Dashboards",
-            label=__("Dashboards"),
-            icon="fa-dashboard",
-            category="",
-            category_icon="",
-        )
-        appbuilder.add_view(
-            CssTemplateModelView,
-            "CSS Templates",
-            label=__("CSS Templates"),
-            icon="fa-css3",
-            category="Manage",
-            category_label=__("Manage"),
-            category_icon="",
-        )
-        appbuilder.add_view(
-            QueryView,
-            "Queries",
-            label=__("Queries"),
-            category="Manage",
-            category_label=__("Manage"),
-            icon="fa-search",
-        )
-        if self.config["ENABLE_ROW_LEVEL_SECURITY"]:
-            appbuilder.add_view(
-                RowLevelSecurityFiltersModelView,
-                "Row Level Security Filters",
-                label=__("Row level security filters"),
-                category="Security",
-                category_label=__("Security"),
-                icon="fa-lock",
-            )
-
-        #
-        # Setup views with no menu
-        #
-        appbuilder.add_view_no_menu(Api)
-        appbuilder.add_view_no_menu(CssTemplateAsyncModelView)
-        appbuilder.add_view_no_menu(CsvToDatabaseView)
-        appbuilder.add_view_no_menu(Dashboard)
-        appbuilder.add_view_no_menu(DashboardModelViewAsync)
-        appbuilder.add_view_no_menu(Datasource)
-
-        if feature_flag_manager.is_feature_enabled("KV_STORE"):
-            appbuilder.add_view_no_menu(KV)
-
-        appbuilder.add_view_no_menu(R)
-        appbuilder.add_view_no_menu(SavedQueryView)
-        appbuilder.add_view_no_menu(SavedQueryViewApi)
-        appbuilder.add_view_no_menu(SliceAsync)
-        appbuilder.add_view_no_menu(SqlLab)
-        appbuilder.add_view_no_menu(SqlMetricInlineView)
-        appbuilder.add_view_no_menu(Superset)
-        appbuilder.add_view_no_menu(TableColumnInlineView)
-        appbuilder.add_view_no_menu(TableModelView)
-        appbuilder.add_view_no_menu(TableSchemaView)
-        appbuilder.add_view_no_menu(TabStateView)
-
-        if feature_flag_manager.is_feature_enabled("TAGGING_SYSTEM"):
-            appbuilder.add_view_no_menu(TagView)
-
-        #
-        # Add links
-        #
-        appbuilder.add_link(
-            "Import Dashboards",
-            label=__("Import Dashboards"),
-            href="/superset/import_dashboards",
-            icon="fa-cloud-upload",
-            category="Manage",
-            category_label=__("Manage"),
-            category_icon="fa-wrench",
-        )
-        appbuilder.add_link(
-            "SQL Editor",
-            label=_("SQL Editor"),
-            href="/superset/sqllab",
-            category_icon="fa-flask",
-            icon="fa-flask",
-            category="SQL Lab",
-            category_label=__("SQL Lab"),
-        )
-        appbuilder.add_link(
-            __("Saved Queries"),
-            href="/sqllab/my_queries/",
-            icon="fa-save",
-            category="SQL Lab",
-        )
-        appbuilder.add_link(
-            "Query Search",
-            label=_("Query Search"),
-            href="/superset/sqllab#search",
-            icon="fa-search",
-            category_icon="fa-flask",
-            category="SQL Lab",
-            category_label=__("SQL Lab"),
-        )
-        appbuilder.add_link(
-            "Upload a CSV",
-            label=__("Upload a CSV"),
-            href="/csvtodatabaseview/form",
-            icon="fa-upload",
-            category="Sources",
-            category_label=__("Sources"),
-            category_icon="fa-wrench",
-        )
-
-        #
-        # Conditionally setup log views
-        #
-        if self.config["FAB_ADD_SECURITY_VIEWS"] and self.config["SUPERSET_LOG_VIEW"]:
-            appbuilder.add_api(LogRestApi)
-            appbuilder.add_view(
-                LogModelView,
-                "Action Log",
-                label=__("Action Log"),
-                category="Security",
-                category_label=__("Security"),
-                icon="fa-list-ol",
-            )
-
-        #
-        # Conditionally setup email views
-        #
-        if self.config["ENABLE_SCHEDULED_EMAIL_REPORTS"]:
-            appbuilder.add_separator("Manage")
-            appbuilder.add_view(
-                DashboardEmailScheduleView,
-                "Dashboard Email Schedules",
-                label=__("Dashboard Emails"),
-                category="Manage",
-                category_label=__("Manage"),
-                icon="fa-search",
-            )
-            appbuilder.add_view(
-                SliceEmailScheduleView,
-                "Chart Emails",
-                label=__("Chart Email Schedules"),
-                category="Manage",
-                category_label=__("Manage"),
-                icon="fa-search",
-            )
-
-        #
-        # Conditionally add Access Request Model View
-        #
-        if self.config["ENABLE_ACCESS_REQUEST"]:
-            appbuilder.add_view(
-                AccessRequestsModelView,
-                "Access requests",
-                label=__("Access requests"),
-                category="Security",
-                category_label=__("Security"),
-                icon="fa-table",
-            )
-
-        #
-        # Conditionally setup Druid Views
-        #
-        if self.config["DRUID_IS_ACTIVE"]:
-            appbuilder.add_separator("Sources")
-            appbuilder.add_view(
-                DruidDatasourceModelView,
-                "Druid Datasources",
-                label=__("Druid Datasources"),
-                category="Sources",
-                category_label=__("Sources"),
-                icon="fa-cube",
-            )
-            appbuilder.add_view(
-                DruidClusterModelView,
-                name="Druid Clusters",
-                label=__("Druid Clusters"),
-                icon="fa-cubes",
-                category="Sources",
-                category_label=__("Sources"),
-                category_icon="fa-database",
-            )
-            appbuilder.add_view_no_menu(DruidMetricInlineView)
-            appbuilder.add_view_no_menu(DruidColumnInlineView)
-            appbuilder.add_view_no_menu(Druid)
-
-            if self.config["DRUID_METADATA_LINKS_ENABLED"]:
-                appbuilder.add_link(
-                    "Scan New Datasources",
-                    label=__("Scan New Datasources"),
-                    href="/druid/scan_new_datasources/",
-                    category="Sources",
-                    category_label=__("Sources"),
-                    category_icon="fa-database",
-                    icon="fa-refresh",
-                )
-                appbuilder.add_link(
-                    "Refresh Druid Metadata",
-                    label=__("Refresh Druid Metadata"),
-                    href="/druid/refresh_datasources/",
-                    category="Sources",
-                    category_label=__("Sources"),
-                    category_icon="fa-database",
-                    icon="fa-cog",
-                )
-            appbuilder.add_separator("Sources")
-
-    def init_app_in_ctx(self) -> None:
-        """
-        Runs init logic in the context of the app
-        """
-        self.configure_feature_flags()
-        self.configure_fab()
-        self.configure_url_map_converters()
-        self.configure_data_sources()
-
-        # Hook that provides administrators a handle on the Flask APP
-        # after initialization
-        flask_app_mutator = self.config["FLASK_APP_MUTATOR"]
-        if flask_app_mutator:
-            flask_app_mutator(self.flask_app)
-
-        self.init_views()
-
-    def init_app(self) -> None:
-        """
-        Main entry point which will delegate to other methods in
-        order to fully init the app
-        """
-        self.pre_init()
-
-        self.setup_db()
-
-        self.configure_celery()
-
-        self.setup_event_logger()
-
-        self.setup_bundle_manifest()
-
-        self.register_blueprints()
-
-        self.configure_wtf()
-
-        self.configure_logging()
-
-        self.configure_middlewares()
-
-        self.configure_cache()
-
-        self.configure_jinja_context()
-
-        with self.flask_app.app_context():
-            self.init_app_in_ctx()
-
-        self.post_init()
-
-    def setup_event_logger(self):
-        _event_logger["event_logger"] = get_event_logger_from_cfg_value(
-            self.flask_app.config.get("EVENT_LOGGER", DBEventLogger())
-        )
-
-    def configure_data_sources(self):
-        # Registering sources
-        module_datasource_map = self.config["DEFAULT_MODULE_DS_MAP"]
-        module_datasource_map.update(self.config["ADDITIONAL_MODULE_DS_MAP"])
-        ConnectorRegistry.register_sources(module_datasource_map)
-
-    def configure_cache(self):
-        cache_manager.init_app(self.flask_app)
-        results_backend_manager.init_app(self.flask_app)
-
-    def configure_feature_flags(self):
-        feature_flag_manager.init_app(self.flask_app)
-
-    def configure_fab(self):
-        if self.config["SILENCE_FAB"]:
-            logging.getLogger("flask_appbuilder").setLevel(logging.ERROR)
-
-        custom_sm = self.config["CUSTOM_SECURITY_MANAGER"] or SupersetSecurityManager
-        if not issubclass(custom_sm, SupersetSecurityManager):
-            raise Exception(
-                """Your CUSTOM_SECURITY_MANAGER must now extend SupersetSecurityManager,
-                 not FAB's security manager.
-                 See [4565] in UPDATING.md"""
-            )
-
-        appbuilder.indexview = SupersetIndexView
-        appbuilder.base_template = "superset/base.html"
-        appbuilder.security_manager_class = custom_sm
-        appbuilder.update_perms = False
-        appbuilder.init_app(self.flask_app, db.session)
-
-    def configure_url_map_converters(self):
-        #
-        # Doing local imports here as model importing causes a reference to
-        # app.config to be invoked and we need the current_app to have been setup
-        #
-        from superset.utils.url_map_converters import RegexConverter
-        from superset.utils.url_map_converters import ObjectTypeConverter
-
-        self.flask_app.url_map.converters["regex"] = RegexConverter
-        self.flask_app.url_map.converters["object_type"] = ObjectTypeConverter
-
-    def configure_jinja_context(self):
-        jinja_context_manager.init_app(self.flask_app)
-
-    def configure_middlewares(self):
-        if self.config["ENABLE_CORS"]:
-            from flask_cors import CORS
-
-            CORS(self.flask_app, **self.config["CORS_OPTIONS"])
-
-        if self.config["ENABLE_PROXY_FIX"]:
-            from werkzeug.middleware.proxy_fix import ProxyFix
-
-            self.flask_app.wsgi_app = ProxyFix(
-                self.flask_app.wsgi_app, **self.config["PROXY_FIX_CONFIG"]
-            )
-
-        if self.config["ENABLE_CHUNK_ENCODING"]:
-
-            class ChunkedEncodingFix:  # pylint: disable=too-few-public-methods
-                def __init__(self, app):
-                    self.app = app
-
-                def __call__(self, environ, start_response):
-                    # Setting wsgi.input_terminated tells werkzeug.wsgi to ignore
-                    # content-length and read the stream till the end.
-                    if environ.get("HTTP_TRANSFER_ENCODING", "").lower() == "chunked":
-                        environ["wsgi.input_terminated"] = True
-                    return self.app(environ, start_response)
-
-            self.flask_app.wsgi_app = ChunkedEncodingFix(self.flask_app.wsgi_app)
-
-        if self.config["UPLOAD_FOLDER"]:
+        if ".hot-update." in filename:
+            # First try to serve it normally - it might exist
             try:
-                os.makedirs(self.config["UPLOAD_FOLDER"])
-            except OSError:
-                pass
+                return super().send_static_file(filename)
+            except NotFound:
+                logger.debug(
+                    "Webpack hot-update file not found (likely HMR race condition): %s",
+                    filename,
+                )
+                return Response("", status=204)  # No Content
+        return super().send_static_file(filename)
 
-        for middleware in self.config["ADDITIONAL_MIDDLEWARE"]:
-            self.flask_app.wsgi_app = middleware(self.flask_app.wsgi_app)
+    def _is_database_up_to_date(self) -> bool:
+        """
+        Check if database migrations are up to date.
+        Returns False if there are pending migrations or unable to determine.
+        """
+        try:
+            # Import here to avoid circular import issues
+            from superset.extensions import db
 
-        # Flask-Compress
-        if self.config["ENABLE_FLASK_COMPRESS"]:
-            Compress(self.flask_app)
+            # Get current revision from database
+            with db.engine.connect() as connection:
+                context = MigrationContext.configure(connection)
+                current_rev = context.get_current_revision()
 
-        if self.config["TALISMAN_ENABLED"]:
-            talisman.init_app(self.flask_app, **self.config["TALISMAN_CONFIG"])
+            # Get head revision from migration files
+            alembic_cfg = Config()
+            alembic_cfg.set_main_option("script_location", "superset:migrations")
+            script = ScriptDirectory.from_config(alembic_cfg)
+            head_rev = script.get_current_head()
 
-    def configure_logging(self):
-        self.config["LOGGING_CONFIGURATOR"].configure_logging(
-            self.config, self.flask_app.debug
-        )
+            # Database is up-to-date if current revision matches head
+            is_current = current_rev == head_rev
+            if not is_current:
+                logger.debug(
+                    "Pending migrations. Current: %s, Head: %s",
+                    current_rev,
+                    head_rev,
+                )
+            return is_current
+        except Exception as e:
+            logger.debug("Could not check migration status: %s", e)
+            return False
 
-    def setup_db(self):
-        db.init_app(self.flask_app)
+    def sync_config_to_db(self) -> None:
+        """
+        Synchronize configuration to database.
+        This method handles database-dependent features that need to be synced
+        after the app is initialized and database connection is available.
 
-        with self.flask_app.app_context():
-            pessimistic_connection_handling(db.engine)
+        This is separated from app initialization to support multi-tenant
+        environments where database connection might not be available during
+        app startup.
+        """
+        try:
+            database_ready: bool = self._is_database_up_to_date()
+            # key_value predates pending migrations. Enabled installations can
+            # initialize identity before theme/tag synchronization reaches head.
+            from superset.semantic_layers.access import is_semantic_layers_enabled
+            from superset.semantic_layers.execution import bootstrap_semantic_namespace
 
-        migrate.init_app(self.flask_app, db=db, directory=APP_DIR + "/migrations")
-
-    def configure_wtf(self):
-        if self.config["WTF_CSRF_ENABLED"]:
-            csrf = CSRFProtect(self.flask_app)
-            csrf_exempt_list = self.config["WTF_CSRF_EXEMPT_LIST"]
-            for ex in csrf_exempt_list:
-                csrf.exempt(ex)
-
-    def register_blueprints(self):
-        for bp in self.config["BLUEPRINTS"]:
+            namespace_ready: bool = True
             try:
-                logger.info(f"Registering blueprint: '{bp.name}'")
-                self.flask_app.register_blueprint(bp)
-            except Exception:  # pylint: disable=broad-except
-                logger.exception("blueprint registration failed")
+                if is_semantic_layers_enabled():
+                    bootstrap_semantic_namespace()
+            except Exception as ex:
+                namespace_ready = False
+                if database_ready:
+                    logger.error(
+                        "Failed to bootstrap semantic execution namespace: %s", ex
+                    )
+                else:
+                    logger.info(
+                        "Semantic execution namespace initialization deferred until "
+                        "database upgrade; semantic access will retry (%s)",
+                        type(ex).__name__,
+                    )
 
-    def setup_bundle_manifest(self):
-        manifest_processor.init_app(self.flask_app)
+            # Check if database is up-to-date with migrations
+            if not database_ready:
+                logger.info("Pending database migrations: run 'superset db upgrade'")
+                return
+
+            logger.info("Syncing configuration to database...")
+
+            # Register the tagged_object cleanup listeners for the tagging system.
+            # This is deletion only (see superset.tags.core), and must run
+            # regardless of the flag so a deleted object never leaves orphaned
+            # `tagged_object` rows behind.
+            from superset.tags.core import register_sqla_event_listeners
+
+            register_sqla_event_listeners()
+
+            # Seed system themes from configuration
+            from superset.commands.theme.seed import SeedSystemThemesCommand
+
+            SeedSystemThemesCommand().run()
+
+            if namespace_ready:
+                logger.info("Configuration sync to database completed successfully")
+
+        except Exception as e:
+            logger.error("Failed to sync configuration to database: %s", e)
+            # Don't raise the exception to avoid breaking app startup
+            # in multi-tenant environments
+
+
+class AppRootMiddleware:
+    """A middleware that attaches the application to a fixed prefix location.
+
+    See https://wsgi.readthedocs.io/en/latest/definitions.html for definitions
+    of SCRIPT_NAME and PATH_INFO.
+    """
+
+    def __init__(
+        self,
+        wsgi_app: WSGIApplication,
+        app_root: str,
+    ):
+        self.wsgi_app = wsgi_app
+        # Normalize a trailing slash so "/myapp" and "/myapp/" configure the
+        # same prefix and the segment-boundary check below stays uniform.
+        self.app_root = app_root.rstrip("/")
+
+    def __call__(
+        self, environ: WSGIEnvironment, start_response: StartResponse
+    ) -> Iterable[bytes]:
+        original_path_info = environ.get("PATH_INFO", "")
+        # Segment-boundary match: accept "/myapp" and "/myapp/..." but never
+        # a path that merely shares a string prefix (e.g. "/myapparoo/...").
+        if original_path_info == self.app_root or original_path_info.startswith(
+            self.app_root + "/"
+        ):
+            environ["PATH_INFO"] = original_path_info[len(self.app_root) :]
+            environ["SCRIPT_NAME"] = self.app_root
+            return self.wsgi_app(environ, start_response)
+        return NotFound()(environ, start_response)

@@ -15,14 +15,28 @@
 # specific language governing permissions and limitations
 # under the License.
 from . import (
-    annotations,
+    alerts,
     api,
     base,
     core,
-    dashboard,
-    datasource,
-    schedules,
+    css_templates,
+    dynamic_plugins,
+    health,
     sql_lab,
     tags,
 )
 from .log import api as log_api, views
+
+__all__ = [
+    "alerts",
+    "api",
+    "base",
+    "core",
+    "css_templates",
+    "dynamic_plugins",
+    "health",
+    "log_api",
+    "views",
+    "sql_lab",
+    "tags",
+]

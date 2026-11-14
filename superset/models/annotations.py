@@ -15,15 +15,18 @@
 # specific language governing permissions and limitations
 # under the License.
 """a collection of Annotation-related models"""
+
+from typing import Any
+
 from flask_appbuilder import Model
 from sqlalchemy import Column, DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import relationship
 
-from superset.models.helpers import AuditMixinNullable
+from superset.models.helpers import AuditMixinNullable, ImportExportMixin
+from superset.utils.core import MediumText
 
 
-class AnnotationLayer(Model, AuditMixinNullable):
-
+class AnnotationLayer(Model, AuditMixinNullable, ImportExportMixin):
     """A logical namespace for a set of annotations"""
 
     __tablename__ = "annotation_layer"
@@ -31,12 +34,14 @@ class AnnotationLayer(Model, AuditMixinNullable):
     name = Column(String(250))
     descr = Column(Text)
 
-    def __repr__(self):
-        return self.name
+    export_fields = ["name", "descr"]
+    export_children = ["annotation"]
+
+    def __repr__(self) -> str:
+        return str(self.name)
 
 
-class Annotation(Model, AuditMixinNullable):
-
+class Annotation(Model, AuditMixinNullable, ImportExportMixin):
     """Time-related annotation"""
 
     __tablename__ = "annotation"
@@ -47,12 +52,22 @@ class Annotation(Model, AuditMixinNullable):
     short_descr = Column(String(500))
     long_descr = Column(Text)
     layer = relationship(AnnotationLayer, backref="annotation")
-    json_metadata = Column(Text)
+    json_metadata = Column(MediumText())
+
+    export_parent = "layer"
+    export_fields = [
+        "start_dttm",
+        "end_dttm",
+        "short_descr",
+        "long_descr",
+        "json_metadata",
+        "uuid",
+    ]
 
     __table_args__ = (Index("ti_dag_state", layer_id, start_dttm, end_dttm),)
 
     @property
-    def data(self):
+    def data(self) -> dict[str, Any]:
         return {
             "layer_id": self.layer_id,
             "start_dttm": self.start_dttm,
@@ -61,3 +76,6 @@ class Annotation(Model, AuditMixinNullable):
             "long_descr": self.long_descr,
             "layer": self.layer.name if self.layer else None,
         }
+
+    def __repr__(self) -> str:
+        return str(self.short_descr)

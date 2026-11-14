@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 import logging
+from typing import Any, Optional
 
 from colorama import Fore, Style
 
@@ -40,29 +41,33 @@ class BaseStatsLogger:
         """Decrement a counter"""
         raise NotImplementedError()
 
-    def timing(self, key, value: float) -> None:
+    def timing(self, key: str, value: float) -> None:
         raise NotImplementedError()
 
-    def gauge(self, key: str) -> None:
+    def gauge(self, key: str, value: float) -> None:
         """Setup a gauge"""
         raise NotImplementedError()
 
 
 class DummyStatsLogger(BaseStatsLogger):
-    def incr(self, key):
-        logger.debug(Fore.CYAN + "[stats_logger] (incr) " + key + Style.RESET_ALL)
+    def incr(self, key: str) -> None:
+        logger.debug("%s[stats_logger] (incr) %s%s", Fore.CYAN, key, Style.RESET_ALL)
 
-    def decr(self, key):
-        logger.debug((Fore.CYAN + "[stats_logger] (decr) " + key + Style.RESET_ALL))
+    def decr(self, key: str) -> None:
+        logger.debug("%s[stats_logger] (decr) %s%s", Fore.CYAN, key, Style.RESET_ALL)
 
-    def timing(self, key, value):
+    def timing(self, key: str, value: float) -> None:
         logger.debug(
-            (Fore.CYAN + f"[stats_logger] (timing) {key} | {value} " + Style.RESET_ALL)
+            "%s[stats_logger] (timing) %s | %s %s",
+            Fore.CYAN,
+            key,
+            value,
+            Style.RESET_ALL,
         )
 
-    def gauge(self, key):
+    def gauge(self, key: str, value: float) -> None:
         logger.debug(
-            (Fore.CYAN + "[stats_logger] (gauge) " + f"{key}" + Style.RESET_ALL)
+            "%s[stats_logger] (gauge) %s%s%s", Fore.CYAN, key, value, Style.RESET_ALL
         )
 
 
@@ -71,8 +76,12 @@ try:
 
     class StatsdStatsLogger(BaseStatsLogger):
         def __init__(  # pylint: disable=super-init-not-called
-            self, host="localhost", port=8125, prefix="superset", statsd_client=None
-        ):
+            self,
+            host: str = "localhost",
+            port: int = 8125,
+            prefix: str = "superset",
+            statsd_client: Optional[StatsClient] = None,
+        ) -> None:
             """
             Initializes from either params or a supplied, pre-constructed statsd client.
 
@@ -84,19 +93,39 @@ try:
             else:
                 self.client = StatsClient(host=host, port=port, prefix=prefix)
 
-        def incr(self, key):
+        def incr(self, key: str) -> None:
             self.client.incr(key)
 
-        def decr(self, key):
+        def decr(self, key: str) -> None:
             self.client.decr(key)
 
-        def timing(self, key, value):
+        def timing(self, key: str, value: float) -> None:
             self.client.timing(key, value)
 
-        def gauge(self, key):
-            # pylint: disable=no-value-for-parameter
-            self.client.gauge(key)
+        def gauge(self, key: str, value: float) -> None:
+            self.client.gauge(key, value)
 
+except Exception as e:  # pylint: disable=broad-except  # noqa: S110
+    # e can only be accessed in the catch and not later during class instantiation.
+    # We have to save it to a separate variable.
+    _saved_exception = e
 
-except Exception:  # pylint: disable=broad-except
-    pass
+    class StatsdStatsLogger(BaseStatsLogger):  # type:ignore[no-redef] # the redefinition only happens when the original definition failed
+        def __init__(  # pylint: disable=super-init-not-called
+            self,
+            host: str = "localhost",
+            port: int = 8125,
+            prefix: str = "superset",
+            statsd_client: Any = None,
+        ) -> None:
+            """
+            Initializes from either params or a supplied, pre-constructed statsd client.
+
+            If statsd_client argument is given, all other arguments are ignored and the
+            supplied client will be used to emit metrics.
+
+            If an exception is raised while creating the StatsdStatsLogger class, for
+            example because the statsd package is not installed, it will be re-raised
+            on instantiation of the StatsdStatsLogger.
+            """
+            raise _saved_exception

@@ -16,9 +16,9 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-const packageConfig = require('./package.json');
+import packageConfig from './package.json' with { type: 'json' };
 
-module.exports = {
+export default {
   sourceMaps: true,
   sourceType: 'module',
   retainLines: true,
@@ -36,16 +36,29 @@ module.exports = {
     ],
     [
       '@babel/preset-react',
-      { development: process.env.BABEL_ENV === 'development' },
+      {
+        development: process.env.BABEL_ENV === 'development',
+        runtime: 'automatic',
+      },
     ],
+    '@babel/preset-typescript',
   ],
   plugins: [
-    'lodash',
     '@babel/plugin-syntax-dynamic-import',
-    '@babel/plugin-proposal-class-properties',
-    '@babel/plugin-proposal-optional-chaining',
+    '@babel/plugin-transform-export-namespace-from',
+    ['@babel/plugin-transform-class-properties', { loose: true }],
+    '@babel/plugin-transform-class-static-block',
+    ['@babel/plugin-transform-optional-chaining', { loose: true }],
+    ['@babel/plugin-transform-private-methods', { loose: true }],
+    ['@babel/plugin-transform-nullish-coalescing-operator', { loose: true }],
     ['@babel/plugin-transform-runtime', { corejs: 3 }],
-    'react-hot-loader/babel',
+    [
+      '@emotion/babel-plugin',
+      {
+        autoLabel: 'dev-only',
+        labelFormat: '[local]',
+      },
+    ],
   ],
   env: {
     // Setup a different config for tests as they run in node instead of a browser
@@ -58,12 +71,60 @@ module.exports = {
             corejs: 3,
             loose: true,
             shippedProposals: true,
-            modules: 'commonjs',
+            modules: 'auto',
             targets: { node: 'current' },
           },
         ],
+        [
+          '@babel/preset-react',
+          {
+            development: process.env.BABEL_ENV === 'development',
+            runtime: 'automatic',
+          },
+        ],
+        '@babel/preset-typescript',
       ],
-      plugins: ['babel-plugin-dynamic-import-node'],
+      plugins: [
+        'babel-plugin-dynamic-import-node',
+        '@babel/plugin-transform-modules-commonjs',
+        '@babel/plugin-transform-export-namespace-from',
+      ],
+    },
+    // build instrumented code for testing code coverage with E2E tests
+    instrumented: {
+      plugins: [
+        [
+          'istanbul',
+          {
+            exclude: ['plugins/**/*', 'packages/**/*'],
+          },
+        ],
+      ],
+    },
+    production: {
+      plugins: [
+        [
+          'babel-plugin-jsx-remove-data-test-id',
+          {
+            // The plugin matches attribute names exactly (no prefix match),
+            // so each data-test* attribute must be listed explicitly.
+            attributes: [
+              'data-test',
+              'data-test-drag-source-id',
+              'data-test-drop-target-id',
+            ],
+          },
+        ],
+      ],
+    },
+    testableProduction: {
+      plugins: [],
     },
   },
+  overrides: [
+    {
+      test: './plugins/plugin-chart-handlebars/node_modules/just-handlebars-helpers/*',
+      sourceType: 'unambiguous',
+    },
+  ],
 };

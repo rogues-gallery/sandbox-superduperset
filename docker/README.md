@@ -19,63 +19,105 @@ under the License.
 
 # Getting Started with Superset using Docker
 
-Docker is an easy way to get started with Superset. 
+Docker is an easy way to get started with Superset.
 
 ## Prerequisites
 
-1. Docker! [link](https://www.docker.com/get-started)
-1. Docker-compose [link](https://docs.docker.com/compose/install/)
+1. [Docker](https://www.docker.com/get-started)
+2. [Docker Compose](https://docs.docker.com/compose/install/)
 
 ## Configuration
 
-The `/app/pythonpath` folder is mounted from [./docker/pythonpath_dev](./docker/pythonpath_dev) 
-which contains a base configuration [./docker/pythonpath/superset_config.py](./docker/pythonpath/superset_config.py) 
+The `/app/pythonpath` folder is mounted from [`./docker/pythonpath_dev`](./pythonpath_dev)
+which contains a base configuration [`./docker/pythonpath_dev/superset_config.py`](./pythonpath_dev/superset_config.py)
 intended for use with local development.
 
 ### Local overrides
 
-In order to override configuration settings locally, simply make a copy of [./docker/pythonpath/superset_config_local.example](./docker/pythonpath/superset_config_local.example)
-into [./docker/pythonpath/superset_config_docker.py](./docker/pythonpath/superset_config_docker.py) (git ignored) and fill in your overrides.
+#### Environment Variables
+
+To override environment variables locally, create a `./docker/.env-local` file (git-ignored). This file will be loaded after `.env` and can override any settings.
+
+#### Python Configuration
+
+In order to override configuration settings locally, simply make a copy of [`./docker/pythonpath_dev/superset_config_local.example`](./pythonpath_dev/superset_config_local.example)
+into `./docker/pythonpath_dev/superset_config_docker.py` (git-ignored) and fill in your overrides.
+
+#### WebSocket Configuration
+
+To customize the WebSocket server configuration, create `./docker/superset-websocket/config.json` (git-ignored) based on [`./docker/superset-websocket/config.example.json`](./superset-websocket/config.example.json).
+
+Then update the `superset-websocket`.`volumes` config to mount it.
+
+#### Docker Compose Overrides
+
+For advanced Docker Compose customization, create a `docker-compose-override.yml` file (git-ignored) to override or extend services without modifying the main compose file.
 
 ### Local packages
 
-If you want to add python packages in order to test things like DBs locally, you can simply add a local requirements.txt (./docker/requirements-local.txt)
-and rebuild your docker stack.
+If you want to add Python packages in order to test things like databases locally, you can simply add a local requirements.txt (`./docker/requirements-local.txt`)
+and rebuild your Docker stack.
 
 Steps:
-    1. Create ./docker/requirements-local.txt
-    2. Add your new packages
-    3. Rebuild docker-compose
-        a. `docker-compose down -v`
-        b. `docker-compose up`
+
+1. Create `./docker/requirements-local.txt`
+2. Add your new packages
+3. Restart the Docker Compose stack so the local packages are installed:
+    1. `docker compose down`
+    2. `docker compose up`
+
+The `docker compose down` command preserves the existing named volumes used by
+the metadata database and other local data. To start from a clean state, run
+`docker compose down -v`.
 
 ## Initializing Database
 
-The DB will initialize itself upon startup via the init container (superset-init)
-(This may take a minute.)
+The database will initialize itself upon startup via the init container ([`superset-init`](./docker-init.sh)). This may take a minute.
 
 ## Normal Operation
 
-To run the container, simply run:
+To run the container, simply run: `docker compose up`
+
+After waiting several minutes for Superset initialization to finish, you can open a browser and view [`http://localhost:8088`](http://localhost:8088)
+to start your journey.
+
+### Running Multiple Instances
+
+If you need to run multiple Superset instances simultaneously (e.g., different branches or clones), use the make targets which automatically find available ports:
 
 ```bash
-docker-compose up
+make up
 ```
 
-After several minutes for superset initialization to finish, you can open a browser and view [`http://localhost:8088`](http://localhost:8088) 
-to start your journey.
+This automatically:
+- Generates a unique project name from your directory
+- Finds available ports (incrementing from defaults if in use)
+- Displays the assigned URLs before starting
+
+Available commands (run from repo root):
+
+| Command | Description |
+|---------|-------------|
+| `make up` | Start services (foreground) |
+| `make up-detached` | Start services (background) |
+| `make down` | Stop all services |
+| `make ps` | Show running containers |
+| `make logs` | Follow container logs |
+| `make nuke` | Stop, remove volumes & local images |
+
+From a subdirectory, use: `make -C $(git rev-parse --show-toplevel) up`
+
+**Important**: Always use these commands instead of plain `docker compose down`, which won't know the correct project name.
 
 ## Developing
 
-While running, the container server will reload on modification of the superset python and javascript source code.
+While running, the container server will reload on modification of the Superset Python and JavaScript source code.
 Don't forget to reload the page to take the new frontend into account though.
 
 ## Production
 
-It is also possible to run Superset in non-development mode: in the `docker-compose.yml` file remove
-the volumes needed for development and change the variable `SUPERSET_ENV` to `production`.
+It is possible to run Superset in non-development mode by using [`docker-compose-non-dev.yml`](../docker-compose-non-dev.yml). This file excludes the volumes needed for development.
 
 ## Resource Constraints
 
-If you are attempting to build on a Mac and it exits with 137 you need to increase your docker resources.
-OSX instructions: https://docs.docker.com/docker-for-mac/#advanced (Search for memory)
+If you are attempting to build on macOS and it exits with 137 you need to increase your Docker resources. See instructions [here](https://docs.docker.com/docker-for-mac/#advanced) (search for memory)

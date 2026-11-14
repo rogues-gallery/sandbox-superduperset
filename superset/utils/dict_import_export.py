@@ -14,37 +14,41 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-# pylint: disable=C,R,W
 import logging
+from typing import Any
 
-from superset.connectors.druid.models import DruidCluster
+from superset import db
 from superset.models.core import Database
 
+EXPORT_VERSION = "1.0.0"
+
+# Lists the charts picked for a chart export, so the importer can tell them
+# apart from charts bundled only as annotation sources. It is a separate file
+# rather than a ``metadata.yaml`` key so older importers, whose metadata schema
+# rejects unknown keys, still load the bundle.
+SELECTED_CHARTS_FILE_NAME = "selected_charts.yaml"
+SELECTED_CHARTS_KEY = "chart_uuids"
 DATABASES_KEY = "databases"
-DRUID_CLUSTERS_KEY = "druid_clusters"
 logger = logging.getLogger(__name__)
 
 
-def export_schema_to_dict(back_references):
+def export_schema_to_dict(back_references: bool) -> dict[str, Any]:
     """Exports the supported import/export schema to a dictionary"""
     databases = [
         Database.export_schema(recursive=True, include_parent_ref=back_references)
     ]
-    clusters = [
-        DruidCluster.export_schema(recursive=True, include_parent_ref=back_references)
-    ]
-    data = dict()
+    data = {}
     if databases:
         data[DATABASES_KEY] = databases
-    if clusters:
-        data[DRUID_CLUSTERS_KEY] = clusters
     return data
 
 
-def export_to_dict(session, recursive, back_references, include_defaults):
-    """Exports databases and druid clusters to a dictionary"""
+def export_to_dict(
+    recursive: bool, back_references: bool, include_defaults: bool
+) -> dict[str, Any]:
+    """Exports databases to a dictionary"""
     logger.info("Starting export")
-    dbs = session.query(Database)
+    dbs = db.session.query(Database)
     databases = [
         database.export_to_dict(
             recursive=recursive,
@@ -54,36 +58,7 @@ def export_to_dict(session, recursive, back_references, include_defaults):
         for database in dbs
     ]
     logger.info("Exported %d %s", len(databases), DATABASES_KEY)
-    cls = session.query(DruidCluster)
-    clusters = [
-        cluster.export_to_dict(
-            recursive=recursive,
-            include_parent_ref=back_references,
-            include_defaults=include_defaults,
-        )
-        for cluster in cls
-    ]
-    logger.info("Exported %d %s", len(clusters), DRUID_CLUSTERS_KEY)
-    data = dict()
+    data = {}
     if databases:
         data[DATABASES_KEY] = databases
-    if clusters:
-        data[DRUID_CLUSTERS_KEY] = clusters
     return data
-
-
-def import_from_dict(session, data, sync=[]):
-    """Imports databases and druid clusters from dictionary"""
-    if isinstance(data, dict):
-        logger.info("Importing %d %s", len(data.get(DATABASES_KEY, [])), DATABASES_KEY)
-        for database in data.get(DATABASES_KEY, []):
-            Database.import_from_dict(session, database, sync=sync)
-
-        logger.info(
-            "Importing %d %s", len(data.get(DRUID_CLUSTERS_KEY, [])), DRUID_CLUSTERS_KEY
-        )
-        for datasource in data.get(DRUID_CLUSTERS_KEY, []):
-            DruidCluster.import_from_dict(session, datasource, sync=sync)
-        session.commit()
-    else:
-        logger.info("Supplied object is not a dictionary.")
